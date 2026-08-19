@@ -1,0 +1,125 @@
+name: Clang-Tidy
+
+on:
+  pull_request: {}
+  push: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clang-tidy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VERSION: "20.1.8"
+
+jobs:
+  clang-tidy:
+    name: Clang-Tidy + Static Analyzer
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Setup Xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          clang-tidy --version
+          clang++ --version
+          xmake --version
+          python --version
+
+      - name: Verify clang-tidy configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          clang-tidy --verify-config
+
+      - name: Configure Xmake
+        shell: pwsh
+        env:
+          XMAKE_PKG_CACHEDIR: ${{ runner.temp }}\xmake-package-cache
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          xmake global --policies=package.precompiled:n
+          xmake repo -u
+
+          xmake f `
+            -a x64 `
+            -m release `
+            -p windows `
+            -v `
+            --target_type=client `
+            -y
+
+      - name: Generate compilation database
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          xmake project -k compile_commands
+
+          if (-not (Test-Path "compile_commands.json")) {
+            throw "compile_commands.json was not generated."
+          }
+
+          try {
+            $database = Get-Content "compile_commands.json" -Raw | ConvertFrom-Json
+          }
+          catch {
+            throw "compile_commands.json is not valid JSON: $($_.Exception.Message)"
+          }
+
+          if ($database.Count -eq 0) {
+            throw "compile_commands.json is empty."
+          }
+
+          Write-Host "Compilation database contains $($database.Count) translation units."
+
+      - name: Run clang-tidy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $runClangTidy = Get-Command run-clang-tidy -ErrorAction SilentlyContinue
+
+          if (-not $runClangTidy) {
+            $runClangTidy = Get-Command run-clang-tidy.py -ErrorAction SilentlyContinue
+          }
+
+          if (-not $runClangTidy) {
+            throw "run-clang-tidy was not found in PATH."
+          }
+
+          Write-Host "Using: $($runClangTidy.Source)"
+
+          & $runClangTidy.Source `
+            -p . `
+            -j $env:NUMBER_OF_PROCESSORS `
+            -use-color=false
+
+      - name: Upload compilation database
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: clang-tidy-compilation-database
+          path: compile_commands.json
+          if-no-files-found: ignore
+          retention-days: 7
