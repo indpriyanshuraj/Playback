@@ -80,11 +80,12 @@ private:
     };
 
     struct PendingSubChunkPacket {
-        int                   index = -1;
-        std::string           payload;
-        std::vector<ChunkPos> targets;
-        std::vector<ChunkPos> dependencies;
-        bool                  injected{};
+        int                          index = -1;
+        std::string                  payload;
+        std::vector<ChunkPos>        targets;
+        std::unordered_set<ChunkPos> targetsSet;
+        std::vector<ChunkPos>        dependencies;
+        bool                         injected{};
     };
 
     struct SnapshotColumnIdentity {
