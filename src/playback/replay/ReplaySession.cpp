@@ -1898,7 +1898,7 @@ bool ReplaySession::prepareChunkInjectionPlan(PlaybackView const& view) {
 
             playableEntries.emplace_back(entry);
             subChunkIndicesByColumn[target].emplace(center.y + static_cast<int>(offset.mY));
-            if (std::find(pending.targets.begin(), pending.targets.end(), target) == pending.targets.end()) {
+            if (pending.targetsSet.insert(target).second) {
                 pending.targets.emplace_back(target);
             }
         }
