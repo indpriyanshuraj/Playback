@@ -1,0 +1,191 @@
+name: Clang-Tidy
+
+on:
+  pull_request: {}
+  push: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clang-tidy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VERSION: "20.1.8"
+
+jobs:
+  clang-tidy:
+    name: Clang-Tidy + Static Analyzer
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get Changed Files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            **/*.cpp
+            **/*.h
+            **/*.hpp
+            **/*.c
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v3
+        if: steps.changed-files.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch'
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Setup Xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        if: steps.changed-files.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch'
+
+      - name: Verify toolchain
+        shell: pwsh
+        if: steps.changed-files.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          clang-tidy --version
+          clang++ --version
+          xmake --version
+          python --version
+
+      - name: Verify clang-tidy configuration
+        shell: pwsh
+        if: steps.changed-files.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          clang-tidy --verify-config
+
+      - name: Configure Xmake
+        shell: pwsh
+        if: steps.changed-files.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          XMAKE_PKG_CACHEDIR: ${{ runner.temp }}\xmake-package-cache
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          xmake global --policies=package.precompiled:n
+          xmake repo -u
+
+          xmake f `
+            -a x64 `
+            -m release `
+            -p windows `
+            -v `
+            --target_type=client `
+            -y
+
+      - name: Generate compilation database
+        shell: pwsh
+        if: steps.changed-files.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          xmake project -k compile_commands
+
+          if (-not (Test-Path "compile_commands.json")) {
+            throw "compile_commands.json was not generated."
+          }
+
+          try {
+            $database = Get-Content "compile_commands.json" -Raw | ConvertFrom-Json
+          }
+          catch {
+            throw "compile_commands.json is not valid JSON: $($_.Exception.Message)"
+          }
+
+          if ($database.Count -eq 0) {
+            throw "compile_commands.json is empty."
+          }
+
+          Write-Host "Compilation database contains $($database.Count) translation units."
+
+      - name: Add Problem Matcher
+        if: steps.changed-files.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: echo "::add-matcher::.github/clang-tidy-matcher.json"
+
+      - name: Run clang-tidy
+        shell: pwsh
+        if: steps.changed-files.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $runClangTidy = Get-Command run-clang-tidy -ErrorAction SilentlyContinue
+
+          if (-not $runClangTidy) {
+            $runClangTidy = Get-Command run-clang-tidy.py -ErrorAction SilentlyContinue
+          }
+
+          if (-not $runClangTidy) {
+            throw "run-clang-tidy was not found in PATH."
+          }
+
+          Write-Host "Using: $($runClangTidy.Source)"
+
+          $changedFiles = "${{ steps.changed-files.outputs.all_changed_files }}"
+
+          # Replace spaces with pipe for run-clang-tidy regex
+          $fileRegex = ".*"
+          if ([string]::IsNullOrWhiteSpace($changedFiles) -eq $false) {
+             # Replace forward slashes from tj-actions with backslashes or forward slashes via regex
+             # since run-clang-tidy relies on Python's re.match
+             $escapedFiles = $changedFiles.Replace("/", "[/\\]")
+             $fileRegex = $escapedFiles.Replace(" ", "|")
+             $fileRegex = ".*(" + $fileRegex + ").*"
+          }
+
+          Write-Host "Running clang-tidy on files matching: $fileRegex"
+
+          # Redirect output to file for summary parsing while still writing to host
+          python $runClangTidy.Source `
+            -p . `
+            -j $env:NUMBER_OF_PROCESSORS `
+            $fileRegex 2>&1 | Tee-Object -FilePath clang-tidy-output.txt
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "clang-tidy execution failed with exit code $LASTEXITCODE"
+            # Explicitly throw so workflow fails
+            throw "clang-tidy failed"
+          }
+
+          # Restore ErrorAction
+          $ErrorActionPreference = 'Stop'
+
+      - name: Generate Summary
+        shell: pwsh
+        if: always() && (steps.changed-files.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch')
+        run: |
+          if (Test-Path clang-tidy-output.txt) {
+            $output = Get-Content clang-tidy-output.txt
+            $warnings = ($output | Select-String -Pattern "warning:").Count
+            $errors = ($output | Select-String -Pattern "error:").Count
+
+            Write-Host "### Clang-Tidy Results :mag:" >> $env:GITHUB_STEP_SUMMARY
+            Write-Host "| Type | Count |" >> $env:GITHUB_STEP_SUMMARY
+            Write-Host "| --- | --- |" >> $env:GITHUB_STEP_SUMMARY
+            Write-Host "| Warnings :warning: | $warnings |" >> $env:GITHUB_STEP_SUMMARY
+            Write-Host "| Errors :x: | $errors |" >> $env:GITHUB_STEP_SUMMARY
+
+            if ($errors -gt 0) {
+                Write-Host "" >> $env:GITHUB_STEP_SUMMARY
+                Write-Host "**Please review the inline PR annotations to fix these errors.**" >> $env:GITHUB_STEP_SUMMARY
+            }
+          }
+
+      - name: Upload compilation database
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-compilation-database
+          path: compile_commands.json
+          if-no-files-found: ignore
+          retention-days: 7
