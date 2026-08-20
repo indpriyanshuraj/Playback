@@ -38,7 +38,7 @@ jobs:
             **/*.c
 
       - name: Install LLVM and Clang
-        uses: KyleMayes/install-llvm-action@v3
+        uses: KyleMayes/install-llvm-action@v2
         if: steps.changed-files.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch'
         with:
           version: ${{ env.LLVM_VERSION }}

@@ -32,6 +32,17 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 LL_TYPE_INSTANCE_HOOK(
+    PlaybackCanRenderHook,
+    ll::memory::HookPriority::Highest,
+    MinecraftGame,
+    &MinecraftGame::_canRender,
+    bool
+) {
+    if (exporting::isExportActivityActive()) return true;
+    return origin();
+}
+
+LL_TYPE_INSTANCE_HOOK(
     PlaybackFocusStateHook,
     ll::memory::HookPriority::Highest,
     AppPlatform,
@@ -42,40 +53,29 @@ LL_TYPE_INSTANCE_HOOK(
     return origin();
 }
 
-LL_TYPE_INSTANCE_HOOK(
-    PlaybackPauseHook,
-    ll::memory::HookPriority::Highest,
-    MinecraftGame,
-    &MinecraftGame::$openPauseMenu,
-    void
-) {
-    if (exporting::isExportActivityActive()) return;
-    origin();
-}
-
 } // namespace
 
 bool hookIdleDetection(bool enable) {
     struct HookState {
         bool warning{};
+        bool canRender{};
         bool focusState{};
-        bool pause{};
     };
     static HookState state;
 
-    auto allInstalled  = [&] { return state.warning && state.focusState && state.pause; };
-    auto noneInstalled = [&] { return !state.warning && !state.focusState && !state.pause; };
+    auto allInstalled  = [&] { return state.warning && state.canRender && state.focusState; };
+    auto noneInstalled = [&] { return !state.warning && !state.canRender && !state.focusState; };
     auto installAll    = [&] {
         if (!state.warning) state.warning = PlaybackSuspendWarningModalHook::hook() == 0;
         if (!state.warning) return false;
+        if (!state.canRender) state.canRender = PlaybackCanRenderHook::hook() == 0;
+        if (!state.canRender) return false;
         if (!state.focusState) state.focusState = PlaybackFocusStateHook::hook() == 0;
-        if (!state.focusState) return false;
-        if (!state.pause) state.pause = PlaybackPauseHook::hook() == 0;
-        return state.pause;
+        return state.focusState;
     };
     auto removeAll = [&] {
-        if (state.pause && PlaybackPauseHook::unhook()) state.pause = false;
         if (state.focusState && PlaybackFocusStateHook::unhook()) state.focusState = false;
+        if (state.canRender && PlaybackCanRenderHook::unhook()) state.canRender = false;
         if (state.warning && PlaybackSuspendWarningModalHook::unhook()) state.warning = false;
         return noneInstalled();
     };
