@@ -136,9 +136,14 @@ jobs:
           # Replace spaces with pipe for run-clang-tidy regex
           $fileRegex = ".*"
           if ([string]::IsNullOrWhiteSpace($changedFiles) -eq $false) {
-             # Replace forward slashes from tj-actions with backslashes or forward slashes via regex
-             # since run-clang-tidy relies on Python's re.match
-             $escapedFiles = $changedFiles.Replace("/", "[/\\]")
+             # Replace literal backslashes with double backslashes so python re.compile does not treat them as escape characters
+             $escapedFiles = $changedFiles.Replace("\", "\\")
+             # Replace forward slashes from tj-actions with explicitly escaped backslash or forward slash.
+             $escapedFiles = $escapedFiles.Replace("/", "[/\\]")
+
+             # Also replace regex control characters like '.' if needed
+             $escapedFiles = $escapedFiles.Replace(".", "\.")
+
              $fileRegex = $escapedFiles.Replace(" ", "|")
              $fileRegex = ".*(" + $fileRegex + ").*"
           }
