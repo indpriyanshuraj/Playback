@@ -1883,7 +1883,7 @@ bool ReplaySession::prepareChunkInjectionPlan(PlaybackView const& view) {
             if (!isSuccessfulSubChunkResult(result)) continue;
             auto const&    offset = *entry.mSubChunkPosOffset;
             ChunkPos const target{center.x + static_cast<int>(offset.mX), center.z + static_cast<int>(offset.mZ)};
-            if (!levelChunkPositions.contains(target) && !mSnapshotChunks.contains(target)) {
+            if (!levelChunkIndices.contains(target) && !mSnapshotChunks.contains(target)) {
                 if (mApplyingChunkSnapshot) {
                     getLogger().error(
                         "Replay snapshot SubChunk packet {} targets column ({}, {}) without a LevelChunk",
