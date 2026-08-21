@@ -1,0 +1,3 @@
+[submodule ".skills/xmake-skills"]
+	path = .skills/xmake-skills
+	url = https://github.com/xmake-io/xmake-skills
