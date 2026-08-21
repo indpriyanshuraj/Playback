@@ -218,9 +218,18 @@ void writeCameraSpaces(
     size_t                      appliedCount{};
     for (auto* camera : localCameras) {
         if (!camera || camera == &worldCamera) continue;
-        if (std::find(applied.begin(), applied.begin() + appliedCount, camera) != applied.begin() + appliedCount) {
+
+        bool isApplied = false;
+        for (size_t i = 0; i < appliedCount; ++i) {
+            if (applied[i] == camera) {
+                isApplied = true;
+                break;
+            }
+        }
+        if (isApplied) {
             continue;
         }
+
         writeLocalCameraPose(*camera, basis);
         applied[appliedCount++] = camera;
     }
@@ -518,16 +527,14 @@ keyframe::CameraTimelineRenderContextHandle makePreviewRenderContext(float parti
     keyframe::setPreviewCameraApplied(true);
     keyframe::setLastPreviewPose(sample->state);
     gParkedObserverCamera = sample->state;
-    return keyframe::publishCameraTimelineRenderContext(
-        keyframe::CameraTimelineRenderContext{
-            *time,
-            keyframe::CameraTimelineSource::Preview,
-            0,
-            std::move(sample),
-            {},
-            serial,
-        }
-    );
+    return keyframe::publishCameraTimelineRenderContext(keyframe::CameraTimelineRenderContext{
+        *time,
+        keyframe::CameraTimelineSource::Preview,
+        0,
+        std::move(sample),
+        {},
+        serial,
+    });
 }
 
 LL_TYPE_INSTANCE_HOOK(
