@@ -1768,13 +1768,13 @@ bool ReplaySession::prepareChunkInjectionPlan(PlaybackView const& view) {
     };
 
     std::vector<PrioritizedLevelChunk>                    levelChunks;
-    std::unordered_set<ChunkPos>                          levelChunkPositions;
+    std::unordered_map<ChunkPos, size_t>                  levelChunkIndices;
     std::unordered_set<ChunkPos>                          requestModeLevelChunks;
     std::unordered_map<ChunkPos, SnapshotColumnIdentity>  targetColumns;
     std::unordered_map<ChunkPos, std::unordered_set<int>> subChunkIndicesByColumn;
     size_t                                                skippedBlobCachePackets = 0;
     levelChunks.reserve(mPendingLevelChunkIndices.size());
-    levelChunkPositions.reserve(mPendingLevelChunkIndices.size());
+    levelChunkIndices.reserve(mPendingLevelChunkIndices.size());
     requestModeLevelChunks.reserve(mPendingLevelChunkIndices.size());
 
     for (int index : mPendingLevelChunkIndices) {
@@ -1797,11 +1797,8 @@ bool ReplaySession::prepareChunkInjectionPlan(PlaybackView const& view) {
         }
 
         ChunkPos const pos = *levelChunk.mPos;
-        if (!levelChunkPositions.emplace(pos).second) {
-            auto const duplicate = std::find_if(levelChunks.begin(), levelChunks.end(), [&pos](auto const& existing) {
-                return existing.pos == pos;
-            });
-            if (duplicate != levelChunks.end()) duplicate->index = index;
+        if (auto it = levelChunkIndices.find(pos); it != levelChunkIndices.end()) {
+            levelChunks[it->second].index = index;
             if (static_cast<bool>(levelChunk.mClientNeedsToRequestSubchunks)) {
                 requestModeLevelChunks.emplace(pos);
             } else {
@@ -1810,6 +1807,7 @@ bool ReplaySession::prepareChunkInjectionPlan(PlaybackView const& view) {
             targetColumns[pos].levelChunkIndex = index;
             continue;
         }
+        levelChunkIndices.emplace(pos, levelChunks.size());
         if (static_cast<bool>(levelChunk.mClientNeedsToRequestSubchunks)) {
             requestModeLevelChunks.emplace(pos);
         }
@@ -1834,7 +1832,9 @@ bool ReplaySession::prepareChunkInjectionPlan(PlaybackView const& view) {
     }
 
     auto& protectedChunks = mApplyingChunkSnapshot ? mApplyingSnapshotChunks : mSnapshotChunks;
-    protectedChunks.insert(levelChunkPositions.begin(), levelChunkPositions.end());
+    for (auto const& item : levelChunkIndices) {
+        protectedChunks.insert(item.first);
+    }
 
     std::vector<PrioritizedSubChunk> subChunks;
     subChunks.reserve(mPendingSubChunkIndices.size());
@@ -1883,7 +1883,7 @@ bool ReplaySession::prepareChunkInjectionPlan(PlaybackView const& view) {
             if (!isSuccessfulSubChunkResult(result)) continue;
             auto const&    offset = *entry.mSubChunkPosOffset;
             ChunkPos const target{center.x + static_cast<int>(offset.mX), center.z + static_cast<int>(offset.mZ)};
-            if (!levelChunkPositions.contains(target) && !mSnapshotChunks.contains(target)) {
+            if (!levelChunkIndices.contains(target) && !mSnapshotChunks.contains(target)) {
                 if (mApplyingChunkSnapshot) {
                     getLogger().error(
                         "Replay snapshot SubChunk packet {} targets column ({}, {}) without a LevelChunk",
