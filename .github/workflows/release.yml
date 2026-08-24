@@ -3,6 +3,11 @@ on:
     types:
       - published
 
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -10,11 +15,14 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: xmake-io/github-action-setup-xmake@v1
         # with:
         #   xmake-version: branch@master
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - run: |
           xmake global --policies=package.precompiled:n
@@ -23,6 +31,8 @@ jobs:
           xmake repo -u
         env:
           XMAKE_PKG_CACHEDIR: ${{ runner.temp }}/xmake-package-cache-${{ github.run_id }}
+          SCCACHE_GHA_ENABLED: "true"
+
 
       - id: package-repositories
         shell: pwsh
@@ -41,22 +51,26 @@ jobs:
           }
           "revisions=$($revisions -join '-')" >> $env:GITHUB_OUTPUT
 
-      - uses: actions/cache@v6
+      - uses: actions/cache@v4
         with:
           path: ~/AppData/Local/.xmake/packages
           key: xmake-packages-source-${{ runner.os }}-${{ steps.package-repositories.outputs.revisions }}-${{ hashFiles('xmake.lua') }}
 
       - run: |
-          xmake f -a x64 -m release -p windows --target_type=client -y
+          xmake f -a x64 -m release -p windows --target_type=client --ccache=sccache -y
         env:
           XMAKE_PKG_CACHEDIR: ${{ runner.temp }}/xmake-package-cache-${{ github.run_id }}
+          SCCACHE_GHA_ENABLED: "true"
+
 
       - run: |
           xmake -w -y
         env:
           XMAKE_PKG_CACHEDIR: ${{ runner.temp }}/xmake-package-cache-${{ github.run_id }}
+          SCCACHE_GHA_ENABLED: "true"
 
-      - uses: actions/upload-artifact@v7
+
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.repository.name }}-${{ github.sha }}-client-windows-x64
           path: |
@@ -67,7 +81,7 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - id: extract-release-notes
         uses: ffurrer2/extract-release-notes@v3
@@ -85,9 +99,9 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           name: ${{ github.event.repository.name }}-${{ github.sha }}-client-windows-x64
           path: artifact
