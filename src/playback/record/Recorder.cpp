@@ -720,7 +720,7 @@ Recorder::SnapshotCaptureResult Recorder::captureChunkSnapshot(std::chrono::stea
             || chunk->mLoadState->load(std::memory_order_acquire) != ChunkState::Loaded) {
             continue;
         }
-        columns.push_back(SnapshotColumn{pos, std::move(chunk)});
+        columns.emplace_back(pos, std::move(chunk));
     }
 
     auto const& position = localPlayer->getPosition();
@@ -776,7 +776,7 @@ Recorder::SnapshotCaptureResult Recorder::captureChunkSnapshot(std::chrono::stea
         if (start >= numColumns) break;
         size_t end = std::min(start + batchSize, numColumns);
 
-        futures.push_back(std::async(
+        futures.emplace_back(std::async(
             std::launch::async,
             [&columns, start, end, dimension, air, dimensionMinHeight]() -> std::vector<ColumnResult> {
                 std::vector<ColumnResult> results;
@@ -784,7 +784,7 @@ Recorder::SnapshotCaptureResult Recorder::captureChunkSnapshot(std::chrono::stea
 
                 auto saveContext = SaveContextFactory::createNetworkSaveContext();
                 if (!saveContext) {
-                    results.push_back({{}, {}, "Unable to create a network SaveContext for block actors"});
+                    results.emplace_back(nullptr, nullptr, "Unable to create a network SaveContext for block actors");
                     return results;
                 }
 
@@ -797,14 +797,14 @@ Recorder::SnapshotCaptureResult Recorder::captureChunkSnapshot(std::chrono::stea
                         || chunk.mLoadState->load(std::memory_order_acquire) != ChunkState::Loaded) {
                         result.error =
                             snapshotFailure(pos, std::nullopt, "starting column serialization", "chunk unloaded");
-                        results.push_back(std::move(result));
+                        results.emplace_back(std::move(result));
                         return results;
                     }
 
                     auto const& subChunks = *chunk.mSubChunks;
                     if (subChunks.empty()) {
                         result.error = snapshotFailure(pos, std::nullopt, "validating slots", "no subchunk slots");
-                        results.push_back(std::move(result));
+                        results.emplace_back(std::move(result));
                         return results;
                     }
                     std::string stage = "creating LevelChunkPacket";
@@ -813,7 +813,7 @@ Recorder::SnapshotCaptureResult Recorder::captureChunkSnapshot(std::chrono::stea
                         if (!levelBase || levelBase->getId() != MinecraftPacketIds::FullChunkData) {
                             result.error =
                                 snapshotFailure(pos, std::nullopt, stage, "native packet factory returned wrong type");
-                            results.push_back(std::move(result));
+                            results.emplace_back(std::move(result));
                             return results;
                         }
                         auto level = std::static_pointer_cast<LevelChunkPacket>(std::move(levelBase));
@@ -838,7 +838,7 @@ Recorder::SnapshotCaptureResult Recorder::captureChunkSnapshot(std::chrono::stea
                         if (!subChunkBase || subChunkBase->getId() != MinecraftPacketIds::SubChunkPacket) {
                             result.error =
                                 snapshotFailure(pos, std::nullopt, stage, "native packet factory returned wrong type");
-                            results.push_back(std::move(result));
+                            results.emplace_back(std::move(result));
                             return results;
                         }
                         auto      subChunkPacket   = std::static_pointer_cast<SubChunkPacket>(std::move(subChunkBase));
@@ -871,7 +871,7 @@ Recorder::SnapshotCaptureResult Recorder::captureChunkSnapshot(std::chrono::stea
                                     stage,
                                     "subchunk offset is outside the packet range"
                                 );
-                                results.push_back(std::move(result));
+                                results.emplace_back(std::move(result));
                                 return results;
                             }
 
@@ -914,15 +914,15 @@ Recorder::SnapshotCaptureResult Recorder::captureChunkSnapshot(std::chrono::stea
                         }
                     } catch (std::exception const& exception) {
                         result.error = snapshotFailure(pos, std::nullopt, stage, exception.what());
-                        results.push_back(std::move(result));
+                        results.emplace_back(std::move(result));
                         return results;
                     } catch (...) {
                         result.error = snapshotFailure(pos, std::nullopt, stage, "unknown engine serialization error");
-                        results.push_back(std::move(result));
+                        results.emplace_back(std::move(result));
                         return results;
                     }
 
-                    results.push_back(std::move(result));
+                    results.emplace_back(std::move(result));
                 }
                 return results;
             }
@@ -955,7 +955,7 @@ Recorder::SnapshotCaptureResult Recorder::captureChunkSnapshot(std::chrono::stea
     auto                                      appendEntityPacket = [&entityPackets](Packet const& packet) {
         PlaybackBuffer stream;
         packet.write(stream);
-        entityPackets.push_back({static_cast<int32_t>(packet.getId()), std::move(stream.mBuffer)});
+        entityPackets.emplace_back(static_cast<int32_t>(packet.getId()), std::move(stream.mBuffer));
     };
 
     try {
@@ -1322,16 +1322,14 @@ bool Recorder::flushGamePackets() {
         return false;
     }
 
-    std::vector<PlaybackSerializedGamePacket> pending;
+    std::vector<AsyncReplaySaver::GamePacket> gamePackets;
     {
         std::scoped_lock lock(mPendingGamePacketsMutex);
-        pending.swap(mPendingGamePackets);
+        if (mPendingGamePackets.empty()) return true;
+        gamePackets.reserve(mPendingGamePackets.size());
+        for (auto& packet : mPendingGamePackets) gamePackets.emplace_back(std::move(packet));
+        mPendingGamePackets.clear();
     }
-
-    if (pending.empty()) return true;
-    std::vector<AsyncReplaySaver::GamePacket> gamePackets;
-    gamePackets.reserve(pending.size());
-    for (auto& packet : pending) gamePackets.emplace_back(std::move(packet));
     if (mAsyncReplaySaver->writeGamePackets(std::move(gamePackets))) return true;
 
     auto error = mAsyncReplaySaver->getError();
@@ -1563,7 +1561,7 @@ void Recorder::recordConfigurationPacket(Packet const& packet, PacketLifecycleSe
             if (cached.mPayload == stream.mBuffer) return;
             if (semantics.keepsSequence()) {
                 mConfigurationPacketIndices.insert_or_assign(packetId, mConfigurationPackets.size());
-                mConfigurationPackets.push_back({packetId, std::move(stream.mBuffer)});
+                mConfigurationPackets.emplace_back(packetId, std::move(stream.mBuffer));
             } else {
                 cached.mPayload = std::move(stream.mBuffer);
             }
@@ -1571,7 +1569,7 @@ void Recorder::recordConfigurationPacket(Packet const& packet, PacketLifecycleSe
         }
 
         mConfigurationPacketIndices.emplace(packetId, mConfigurationPackets.size());
-        mConfigurationPackets.push_back({packetId, std::move(stream.mBuffer)});
+        mConfigurationPackets.emplace_back(packetId, std::move(stream.mBuffer));
     } catch (std::exception const& exception) {
         getLogger().error("Unable to serialize replay configuration packet {}: {}", packet.getName(), exception.what());
     } catch (...) {
@@ -1798,7 +1796,7 @@ void Recorder::recordGamePacket(Packet const& packet) {
         for (auto const& [pendingId, pendingPayload] : mPendingGamePackets) {
             if (pendingId == static_cast<int32_t>(packetId) && pendingPayload == stream.mBuffer) return;
         }
-        mPendingGamePackets.push_back({static_cast<int32_t>(packetId), std::move(stream.mBuffer)});
+        mPendingGamePackets.emplace_back(static_cast<int32_t>(packetId), std::move(stream.mBuffer));
         auto& recordedCount = mRecordedGamePacketCounts[static_cast<int32_t>(packetId)];
         ++recordedCount;
     } catch (std::exception const& exception) {

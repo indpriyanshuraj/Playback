@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
+#include <deque>
 
 class Packet;
 
@@ -162,7 +163,7 @@ private:
 
     std::filesystem::path mRecordPath;
 
-    std::vector<WriteTask>     mQueue;
+    std::deque<WriteTask>      mQueue;
     mutable std::mutex         mQueueMutex;
     std::condition_variable    mCondition;
     std::thread                mWorkerThread;
