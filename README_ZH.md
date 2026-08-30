@@ -5,10 +5,14 @@
   <p>面向 Windows LeviLamina 的开源 Minecraft 基岩版回放录制与电影相机编辑模组，并提供实验性视频导出。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/release-v0.2.0-4c8bf5?style=flat-square" alt="Playback v0.2.0">
+    <img src="https://img.shields.io/badge/release-v0.2.1-4c8bf5?style=flat-square" alt="Playback v0.2.1">
     <img src="https://img.shields.io/badge/Minecraft%20Bedrock-Windows%20x64-62b47a?style=flat-square" alt="Windows x64 Minecraft 基岩版">
-    <img src="https://img.shields.io/badge/LeviLamina-26.10.*-7b68ee?style=flat-square" alt="LeviLamina 26.10">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square" alt="AGPL-3.0 许可证"></a>
+  </p>
+
+  <p>
+    <img src="https://img.shields.io/badge/LeviLamina-26.10.*-7b68ee?style=flat-square" alt="LeviLamina 26.10">
+    <img src="https://img.shields.io/badge/LeviLamina-26.20.*-7b68ee?style=flat-square" alt="LeviLamina 26.20">
   </p>
 
   <p>
@@ -28,7 +32,7 @@
   </p>
 
   <p>
-    <a href="https://discord.gg/mUhRUD8AM"><img src="https://img.shields.io/discord/1531092797367652403?style=for-the-badge&amp;logo=discord" alt="Playback Discord 在线人数"></a>
+    <a href="https://discord.gg/qKrT38mFh7"><img src="https://img.shields.io/discord/1531092797367652403?style=for-the-badge&amp;logo=discord" alt="Playback Discord 在线人数"></a>
     <a href="https://qm.qq.com/q/ufJatMDcha"><img src="https://img.shields.io/badge/QQ-%E5%8A%A0%E5%85%A5%E7%BE%A4%E8%81%8A-EA0000?style=for-the-badge&amp;logo=qq&amp;logoColor=white" alt="加入 Playback QQ 群"></a>
   </p>
 </div>
@@ -93,10 +97,10 @@ Playback 将客户端可见的 Minecraft 基岩版游戏过程录制为便携回
 
 ## 本版更新
 
-`v0.2.0` 新增电影相机关键帧、维度感知预览、实验性 MP4/PNG 导出、D3D11/D3D12 采集、相机区域区块跟随，并完成大规模回放与编辑器架构整理。2026 年 8 月 20 日热更新进一步改进了多人服务器回放兼容性，保留自定义实体注册数据，使视频导出可在 Minecraft 窗口失焦时继续运行，并移除了可能导致有效导出卡在第 0 帧的固定相机邻域检查。
+`v0.2.1` 是同时面向 MC 26.10 和 MC 26.20 的集中修补版本。视频导出改为采集不含 UI 的 RenderDragon 场景目标，并使用具有明确语义的世界提交判据避免稀疏场景卡住；同时阻止 Playback 接管输入时出现 HBUI 待机页面，修复低倍速相机预览回退和暂停停驻问题，并改进编辑器与回放浏览器的滚动、选中反馈、标签、图标和动画。
 
 > [!CAUTION]
-> Playback 当前发布的仍是测试版本，可能直接进行破坏性的格式或配置更新。旧版本创建的回放与 `v0.2.0-mc26.10` 不兼容，必须重新录制。受影响服务器在本次热更新前录制的回放可能已经缺少可移植区块或自定义实体注册数据，这类归档无法修复，也必须重新录制；数据完整的 `v0.2.0-mc26.10` 回放无需转换。配置版本和录制文件的快照上下文版本均保持为 `1`，不提供迁移层。
+> Playback 当前发布的仍是测试版本，可能直接进行破坏性的格式或配置更新。早于 `v0.2.0-mc26.10` 的版本创建的回放不兼容，必须重新录制。受影响服务器在 2026 年 8 月 20 日热更新前录制的回放可能已经缺少可移植区块或自定义实体注册数据，这类归档无法修复，也必须重新录制；数据完整的 `v0.2.0-mc26.10` 回放与 `v0.2.1-mc26.10` 兼容，无需转换。配置版本和录制文件的快照上下文版本均保持为 `1`，不提供迁移层。
 
 > [!IMPORTANT]
 > 主菜单中的 **Playback** 按钮仍依赖轻量 UI 资源包。通过 Lip 或完整 Release ZIP 安装时，资源包会放入 `mods/playback/resource_packs/playback-ui/`；Release 同时提供 `playback-ui.mcpack` 供单独手动导入。
@@ -105,14 +109,17 @@ Playback 将客户端可见的 Minecraft 基岩版游戏过程录制为便携回
 
 ## 兼容性
 
-Playback 针对不同 Minecraft 与 LeviLamina 版本维护独立发行线。产品版本 `0.2.0` 在当前分支发布为 `v0.2.0-mc26.10`；`26.20.*` 请使用下表对应的 MC 26.20 发行版本。
+Playback 针对不同 Minecraft 与 LeviLamina 版本维护独立发行线。产品版本 `0.2.1` 已同时面向两个运行时发布。
 
 | Minecraft / LeviLamina | Playback 版本                                                                       | 状态       |
 | ---------------------- | ----------------------------------------------------------------------------------- | ---------- |
-| `26.10.*`              | [`v0.2.0-mc26.10`](https://github.com/wo55555/Playback/releases/tag/v0.2.0-mc26.10) | 当前测试版 |
-| `26.20.*`              | [`v0.1.1-mc26.20`](https://github.com/wo55555/Playback/releases/tag/v0.1.1-mc26.20) | 维护中     |
+| `26.10.*`              | [`v0.2.1-mc26.10`](https://github.com/wo55555/Playback/releases/tag/v0.2.1-mc26.10) | 当前测试版 |
+| `26.20.*`              | [`v0.2.1-mc26.20`](https://github.com/wo55555/Playback/releases/tag/v0.2.1-mc26.20) | 当前测试版 |
 
 两个版本均面向 Windows x64 平台的 Minecraft 基岩版，并以纯客户端模组形式发布。
+
+> [!NOTE]
+> MC 26.20 有意跳过 `0.2.0` 版本。该运行时上的视频导出无法工作：26.20 头文件错误声明了结构体对齐，导致采集路径从填充字节读取渲染项数量，把所有提交都判定为纯覆盖层，每次导出都卡在第 0 帧。因此 26.20 发行线从 `v0.1.2-mc26.20` 直接进入包含该修复的 `v0.2.1-mc26.20`。MC 26.10 发行线不受影响，已正常发布 `v0.2.0-mc26.10`。
 
 > [!TIP]
 > Playback 为纯客户端模组，支持在本地世界和多人服务器中录制游戏过程。
@@ -146,7 +153,7 @@ Playback 是面向 Windows x64 LeviLamina 客户端的 Minecraft 基岩版回放
 
 ### Playback 可以将回放导出为视频吗？
 
-`v0.2.0-mc26.10` 提供实验性的 H.264 MP4 和 PNG 序列导出。目前仍存在已知限制，并且不包含音频。
+`v0.2.1-mc26.10` 提供实验性的 H.264 MP4 和 PNG 序列导出。目前仍存在已知限制，并且不包含音频。
 
 ### 相机关键帧会跨维度插值吗？
 
@@ -154,7 +161,7 @@ Playback 是面向 Windows x64 LeviLamina 客户端的 Minecraft 基岩版回放
 
 ### 应该安装哪个 Playback 版本？
 
-LeviLamina `26.10.*` 使用 `v0.2.0-mc26.10`。Minecraft/LeviLamina `26.20.*` 使用单独维护的对应发行线。
+LeviLamina `26.10.*` 使用 `v0.2.1-mc26.10`，`26.20.*` 使用 `v0.2.1-mc26.20`。两条发行线独立维护，请勿混装。
 
 ## 开发状态与计划
 
@@ -172,9 +179,10 @@ LeviLamina `26.10.*` 使用 `v0.2.0-mc26.10`。Minecraft/LeviLamina `26.20.*` �
 - 当前不会将待处理的计划刻以及村庄、袭击、POI 等服务端系统保存为权威模拟状态。
 - 编辑器修改目前只存在于内存中，不会在回放会话之间持久化。
 - 实验性视频导出当前生成无音频的 H.264 MP4 或 PNG 序列，尚未实现音频导出，并且仍可能存在运行时问题。
+- 暂不支持灵动视效（Vibrant Visuals）。录制、回放和导出仅在标准渲染器下验证，使用 Playback 前请关闭灵动视效。
 - D3D12 的 SSAA 上限为 2x，D3D11 使用 1x。
 - 相机只能渲染回放数据中实际存在的区块，无法重建从未录制的地形。
-- 本次热更新无法追溯恢复现有回放归档中已经缺失的服务器区块或自定义实体注册数据。
+- 2026 年 8 月 20 日的修复无法追溯恢复现有回放归档中已经缺失的服务器区块或自定义实体注册数据。
 - Minecraft 或 LeviLamina 更新后，需要重新确认兼容性。
 
 报告可复现问题时，请尽量附带日志、相关版本和最小回放文件。

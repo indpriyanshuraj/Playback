@@ -8,26 +8,23 @@
 
 namespace playback::editor::ui {
 
-void EditMode::draw() {
+void EditMode::draw(PanelContext const& ctx) {
     auto& editor = ReplayEditor::getInstance();
 
     float const fontSize           = ImGui::GetFontSize();
     auto const& style              = ImGui::GetStyle();
     float const kMenuHeight        = ImGui::GetFrameHeight() + style.WindowBorderSize * 2.0f;
     float const kStatusHeight      = fontSize + style.WindowPadding.y * 2.0f;
-    float const kCurveWidth        = std::max(280.0f, fontSize * 16.0f);
     float const kSplitterThickness = 4.0f;
     float const kDetailsMinWidth   = std::max(260.0f, fontSize * 15.0f);
     float const kViewportMinWidth  = std::max(320.0f, fontSize * 22.0f);
     float const kViewportMinHeight = std::max(180.0f, fontSize * 12.0f);
     float const kTimelineMinHeight = fontSize * 9.0f;
 
-    ImVec2 displaySize        = ImGui::GetIO().DisplaySize;
-    float  contentHeight      = std::max(1.0f, displaySize.y - kMenuHeight - kStatusHeight);
-    float  curveReservedWidth = editor.mCurveEditorPanel.isOpen() ? kCurveWidth + kSplitterThickness : 0.0f;
-    float  maxDetailsRatio =
-        std::min(0.50f, 1.0f - (kViewportMinWidth + curveReservedWidth) / std::max(1.0f, displaySize.x));
-    float minDetailsRatio                 = std::min(kDetailsMinWidth / std::max(1.0f, displaySize.x), maxDetailsRatio);
+    ImVec2 displaySize                    = ImGui::GetIO().DisplaySize;
+    float  contentHeight                  = std::max(1.0f, displaySize.y - kMenuHeight - kStatusHeight);
+    float  maxDetailsRatio                = std::min(0.50f, 1.0f - kViewportMinWidth / std::max(1.0f, displaySize.x));
+    float  minDetailsRatio                = std::min(kDetailsMinWidth / std::max(1.0f, displaySize.x), maxDetailsRatio);
     editor.mDetailsWidthRatio             = std::clamp(editor.mDetailsWidthRatio, minDetailsRatio, maxDetailsRatio);
     float detailsWidth                    = displaySize.x * editor.mDetailsWidthRatio;
     float leftWidth                       = displaySize.x - detailsWidth;
@@ -48,7 +45,7 @@ void EditMode::draw() {
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar
                 | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_MenuBar
         );
-        editor.mMenuBar.draw();
+        editor.mMenuBar.draw(ctx);
         ImGui::End();
     };
 
@@ -61,7 +58,7 @@ void EditMode::draw() {
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar
                 | ImGuiWindowFlags_NoScrollWithMouse | inputBlock
         );
-        editor.mViewportPanel.draw(true);
+        editor.mViewportPanel.draw(ctx, true);
         ImGui::End();
 
         ImGui::SetNextWindowPos(ImVec2(0, displaySize.y - kStatusHeight));
@@ -72,15 +69,10 @@ void EditMode::draw() {
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar
                 | ImGuiWindowFlags_NoScrollWithMouse | inputBlock
         );
-        editor.mStatusPanel.draw();
+        editor.mStatusPanel.draw(ctx);
         ImGui::End();
         drawMenuBar();
         return;
-    }
-
-    float curveWidth = 0.0f;
-    if (editor.mCurveEditorPanel.isOpen()) {
-        curveWidth = kCurveWidth + kSplitterThickness;
     }
 
     {
@@ -91,32 +83,11 @@ void EditMode::draw() {
         ImGui::SetNextWindowPos(ImVec2(detailsX, detailsY));
         ImGui::SetNextWindowSize(ImVec2(detailsWidth, detailsH));
         ImGui::Begin("##DetailsPanel", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | inputBlock);
-        editor.mDetailsPanel.draw();
+        editor.mDetailsPanel.draw(ctx);
         ImGui::End();
     }
 
-    if (editor.mCurveEditorPanel.isOpen()) {
-        float curveX = leftWidth - curveWidth;
-        float curveY = kMenuHeight;
-        float curveH = contentHeight;
-        ImGui::SetNextWindowPos(ImVec2(curveX, curveY));
-        ImGui::SetNextWindowSize(ImVec2(kCurveWidth, curveH));
-        ImGui::GetForegroundDrawList()->AddLine(
-            ImVec2(curveX - 1, curveY),
-            ImVec2(curveX - 1, curveY + curveH),
-            IM_COL32(0x5a, 0x5a, 0x5a, 0xff)
-        );
-        ImGui::Begin(
-            "##CurveEditorPanel",
-            nullptr,
-            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar
-                | ImGuiWindowFlags_NoScrollWithMouse | inputBlock
-        );
-        editor.mCurveEditorPanel.draw();
-        ImGui::End();
-    }
-
-    float workspaceWidth = leftWidth - curveWidth;
+    float workspaceWidth = leftWidth;
 
     {
         ImGui::SetNextWindowPos(ImVec2(0, kMenuHeight));
@@ -127,7 +98,7 @@ void EditMode::draw() {
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar
                 | ImGuiWindowFlags_NoScrollWithMouse | inputBlock
         );
-        editor.mViewportPanel.draw(false);
+        editor.mViewportPanel.draw(ctx, false);
         ImGui::End();
     }
 
@@ -141,7 +112,7 @@ void EditMode::draw() {
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar
                 | ImGuiWindowFlags_NoScrollWithMouse | inputBlock
         );
-        editor.mTimelinePanel.draw(!popupOpen);
+        editor.mTimelinePanel.draw(ctx, !popupOpen);
         ImGui::End();
     }
 
@@ -216,7 +187,7 @@ void EditMode::draw() {
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar
                 | ImGuiWindowFlags_NoScrollWithMouse | inputBlock
         );
-        editor.mStatusPanel.draw();
+        editor.mStatusPanel.draw(ctx);
         ImGui::End();
     }
 

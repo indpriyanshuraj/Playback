@@ -7,15 +7,13 @@
 #include "playback/state/editing/models/SelectionModel.h"
 
 
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-
-namespace playback::visuals {
-class FrameTap;
-}
 
 namespace playback::state {
 
@@ -24,16 +22,22 @@ public:
     explicit EditorController(EditorContext& context);
     ~EditorController();
 
-    void setFrameTap(visuals::FrameTap* frameTap);
+    void setRendererAvailable(bool available);
     void reset();
     void tickExportBeforeClientUpdate();
+    void tickExportDuringGraphics();
     void tick(bool hudVisible);
 
 private:
-    void publishState(bool hudVisible);
-    void publishCameraTimeline();
-    void ensureProject(int totalTicks, std::string_view replayPath);
-    void applyEditorAction(EditorAction const& action);
+    void               publishState(bool hudVisible);
+    void               publishCameraTimeline();
+    void               ensureProject(int totalTicks, std::string_view replayPath);
+    void               applyEditorAction(EditorAction const& action);
+    void               loadProjectForReplay(std::string_view replayPath);
+    bool               saveProject(std::filesystem::path const& path);
+    void               autosaveIfDue();
+    void               flushProjectOnClose();
+    [[nodiscard]] bool isProjectDirty() const { return mCommandStack.revision() != mSavedRevision; }
     [[nodiscard]] std::optional<state::editing::model::CameraKeyframe> captureCameraKeyframe() const;
     void                                                               refreshBrowser();
     void runBrowserOperation(ReplayBrowserOperation operation, bool hudVisible, auto&& callback) {
@@ -59,6 +63,14 @@ private:
     std::optional<std::string>                     mPreviewCameraId;
     int                                            mProjectTotalTicks{-1};
     bool                                           mExportTickedBeforeClientUpdate{};
+    bool                                           mExportTickReentered{};
+
+    std::filesystem::path                 mProjectFile;
+    std::string                           mProjectError;
+    std::uint64_t                         mSavedRevision{};
+    std::chrono::steady_clock::time_point mLastAutosave{};
+    bool                                  mEditorVisibleLogged{};
+    bool                                  mEditorReadyLatched{};
 };
 
 } // namespace playback::state

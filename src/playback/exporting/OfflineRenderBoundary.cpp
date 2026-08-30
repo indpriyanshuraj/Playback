@@ -1,7 +1,9 @@
-﻿#include "OfflineRenderBoundary.h"
+#include "OfflineRenderBoundary.h"
 
 #include "ExportActivity.h"
 #include "playback/Playback.h"
+#include "playback/editor/graphics/CameraRenderHooks.h"
+#include "playback/editor/graphics/ImGuiRenderer.h"
 #include "playback/keyframe/CameraTimelineRegistry.h"
 #include "playback/replay/ReplaySession.h"
 #include "playback/visuals/ReplaySampleTime.h"
@@ -14,14 +16,11 @@ namespace playback::exporting {
 
 namespace {
 
-constexpr uint32_t MaxCaptureRetries       = 2;
-constexpr uint32_t MaxReplayTickRecoveries = 2;
-constexpr auto     ReplayTickWaitTimeout   = std::chrono::seconds{2};
-constexpr auto     RenderWaitTimeout       = std::chrono::seconds{30};
-constexpr auto     RenderWaitLogInterval   = std::chrono::seconds{2};
-constexpr auto     WarmupSceneTimeout      = std::chrono::seconds{30};
-constexpr uint32_t StableWarmupFrames      = 3;
-constexpr uint32_t ClearRetryWarmupFrames  = 3;
+constexpr auto     ReplayTickWaitTimeout = std::chrono::seconds{2};
+constexpr auto     RenderWaitTimeout     = std::chrono::seconds{30};
+constexpr auto     RenderWaitLogInterval = std::chrono::seconds{2};
+constexpr auto     WarmupSceneTimeout    = std::chrono::seconds{30};
+constexpr uint32_t StableWarmupFrames    = 3;
 
 bool ticketsEqual(visuals::FrameTicket const& left, visuals::FrameTicket const& right) {
     return left.frameIndex == right.frameIndex && left.ptsNumerator == right.ptsNumerator
@@ -30,9 +29,7 @@ bool ticketsEqual(visuals::FrameTicket const& left, visuals::FrameTicket const& 
 
 } // namespace
 
-OfflineRenderBoundary::OfflineRenderBoundary(replay::ReplaySession& replay, visuals::FrameTap& frameTap)
-: mReplay(replay),
-  mDownloads(frameTap) {}
+OfflineRenderBoundary::OfflineRenderBoundary(replay::ReplaySession& replay) : mReplay(replay) {}
 
 OfflineRenderBoundary::~OfflineRenderBoundary() { close(); }
 
@@ -46,18 +43,31 @@ bool OfflineRenderBoundary::open(
     setOfflineRenderActivityActive(false);
     if (!isOfflineRenderClockInstalled()) return false;
     if (!mExecutor.open(settings, project, std::move(cameraFallback))) return false;
-    if (!mDownloads.open(capacity)) {
+    if (!editor::graphics::gImGuiRenderer.openExportCapture(capacity)) {
+        editor::graphics::gImGuiRenderer.closeExportCapture();
         mExecutor.close();
         return false;
     }
-    mCaptureCapacity = capacity;
-
+    mCaptureCapacity          = capacity;
     mMaximumReplayTick        = std::max<int64_t>(0, settings.endTick);
     auto const maximumIntTick = std::min<int64_t>(mMaximumReplayTick, std::numeric_limits<int>::max());
     auto const startTick      = std::clamp<int64_t>(settings.startTick, 0, maximumIntTick);
     visuals::ReplaySampleTime const startTime{startTick, 1};
     auto const cameraSample = keyframe::sampleCameraTimeline(keyframe::CameraTimelineSource::Export, startTime);
     std::optional<replay::ReplayCameraViewpoint> cameraViewpoint;
+    if (auto const rendererCamera = editor::graphics::currentRendererCameraState()) {
+        cameraViewpoint = replay::ReplayCameraViewpoint{
+            rendererCamera->x,
+            rendererCamera->y,
+            rendererCamera->z,
+            rendererCamera->pitch,
+            rendererCamera->yaw,
+            rendererCamera->roll,
+            rendererCamera->fov,
+        };
+    } else {
+        cameraViewpoint = mReplay.currentCameraViewpoint();
+    }
     if (cameraSample) {
         cameraViewpoint = replay::ReplayCameraViewpoint{
             cameraSample->state.x,
@@ -65,25 +75,31 @@ bool OfflineRenderBoundary::open(
             cameraSample->state.z,
             cameraSample->state.pitch,
             cameraSample->state.yaw,
+            cameraSample->state.roll,
+            cameraSample->state.fov,
         };
     }
     mReplay.setExportCameraViewpoint(cameraViewpoint);
+    if (!cameraSample && cameraViewpoint) {
+        Playback::getInstance().getSelf().getLogger().debug(
+            "Export camera timeline has no sample at the start tick; using the observer viewpoint"
+        );
+    }
     if (!mReplay.beginExportTimeline(static_cast<int>(startTick))) {
         mReplay.endExportTimeline();
-        mDownloads.close();
+        editor::graphics::gImGuiRenderer.closeExportCapture();
         mExecutor.close();
         mMaximumReplayTick = 0;
-        mCaptureCapacity   = 0;
         return false;
     }
 
     mTimelineInitialized           = false;
     mInitializationTickObserved    = false;
+    mCaptureArmed                  = false;
     mWarmupFramesRemaining         = settings.warmupFrames;
     mWarmupStableFrames            = 0;
     mWarmupStartedAt               = {};
     mWarmupLastLoggedAt            = {};
-    mReplayTickRecoveryCount       = 0;
     mReplayTickRequestedAt         = {};
     mTickGateSuspendedForDimension = false;
     mState                         = OfflineRenderBoundaryState::Ready;
@@ -101,18 +117,14 @@ void OfflineRenderBoundary::close() {
         mTickGateOpen = false;
     }
     mReplay.endExportTimeline();
-    mDownloads.close();
+    editor::graphics::gImGuiRenderer.closeExportCapture();
     mExecutor.close();
     mPendingFrame.reset();
     mLastSubmittedFrame.reset();
     mCompletedFrameTicket.reset();
     mMaximumReplayTick             = 0;
-    mCaptureCapacity               = 0;
-    mCaptureRetryCount             = 0;
-    mReplayTickRecoveryCount       = 0;
     mWarmupFramesRemaining         = 0;
     mWarmupStableFrames            = 0;
-    mRenderWaitPolls               = 0;
     mRenderWaitStartedAt           = {};
     mRenderWaitLastLoggedAt        = {};
     mReplayTickRequestedAt         = {};
@@ -121,6 +133,7 @@ void OfflineRenderBoundary::close() {
     mTickGateSuspendedForDimension = false;
     mTimelineInitialized           = false;
     mInitializationTickObserved    = false;
+    mCaptureArmed                  = false;
     mState                         = OfflineRenderBoundaryState::Closed;
     mError                         = OfflineRenderBoundaryError::None;
     mMessage.clear();
@@ -135,18 +148,14 @@ void OfflineRenderBoundary::cancel() {
         mTickGateOpen = false;
     }
     mReplay.endExportTimeline();
-    mDownloads.cancel();
+    editor::graphics::gImGuiRenderer.closeExportCapture();
     mExecutor.close();
     mPendingFrame.reset();
     mLastSubmittedFrame.reset();
     mCompletedFrameTicket.reset();
     mMaximumReplayTick             = 0;
-    mCaptureCapacity               = 0;
-    mCaptureRetryCount             = 0;
-    mReplayTickRecoveryCount       = 0;
     mWarmupFramesRemaining         = 0;
     mWarmupStableFrames            = 0;
-    mRenderWaitPolls               = 0;
     mRenderWaitStartedAt           = {};
     mRenderWaitLastLoggedAt        = {};
     mReplayTickRequestedAt         = {};
@@ -155,6 +164,7 @@ void OfflineRenderBoundary::cancel() {
     mTickGateSuspendedForDimension = false;
     mTimelineInitialized           = false;
     mInitializationTickObserved    = false;
+    mCaptureArmed                  = false;
     mState                         = OfflineRenderBoundaryState::Cancelled;
     mError                         = OfflineRenderBoundaryError::None;
     mMessage                       = "Offline rendering was cancelled";
@@ -189,7 +199,14 @@ OfflineRenderStepResult OfflineRenderBoundary::advance(ExportFramePlan const& fr
         return OfflineRenderStepResult::Failed;
     }
     if (!mPendingFrame) {
-        if (!mDownloads.canRequestDownload()) return OfflineRenderStepResult::Backpressured;
+        auto const capture = editor::graphics::gImGuiRenderer.exportCaptureStatus();
+        if (capture.state != visuals::FrameTapState::Active) {
+            fault(OfflineRenderBoundaryError::CaptureUnavailable, "The export frame capture is not open");
+            return OfflineRenderStepResult::Failed;
+        }
+        if (capture.bufferedFrames + capture.inFlightFrames >= mCaptureCapacity) {
+            return OfflineRenderStepResult::Backpressured;
+        }
         mPendingFrame = frame;
         mState        = !mTimelineInitialized ? OfflineRenderBoundaryState::InitializingReplay
                                               : OfflineRenderBoundaryState::WarmingUp;
@@ -199,8 +216,7 @@ OfflineRenderStepResult OfflineRenderBoundary::advance(ExportFramePlan const& fr
         && (mState == OfflineRenderBoundaryState::InitializingReplay
             || mState == OfflineRenderBoundaryState::PreparingReplay)) {
         mReplayTickToken.reset();
-        mReplayTickRecoveryCount = 0;
-        mReplayTickRequestedAt   = {};
+        mReplayTickRequestedAt = {};
         runtime::endOfflineReplayTickGate();
         mTickGateOpen                  = false;
         mTickGateSuspendedForDimension = true;
@@ -208,7 +224,7 @@ OfflineRenderStepResult OfflineRenderBoundary::advance(ExportFramePlan const& fr
         mWarmupStartedAt               = {};
         mWarmupLastLoggedAt            = {};
         setOfflineRenderActivityActive(false);
-        Playback::getInstance().getSelf().getLogger().info(
+        Playback::getInstance().getSelf().getLogger().debug(
             "Offline replay tick gate suspended for a native dimension transition at replay tick {}",
             mReplay.getAppliedReplayTick()
         );
@@ -265,6 +281,7 @@ OfflineRenderStepResult OfflineRenderBoundary::advance(ExportFramePlan const& fr
             }
             mTimelineInitialized        = true;
             mInitializationTickObserved = false;
+            mCaptureArmed               = false;
         }
 
         if (!runtime::beginOfflineReplayTickGate()) {
@@ -273,7 +290,7 @@ OfflineRenderStepResult OfflineRenderBoundary::advance(ExportFramePlan const& fr
         }
         mTickGateOpen = true;
         if (mTickGateSuspendedForDimension) {
-            Playback::getInstance().getSelf().getLogger().info(
+            Playback::getInstance().getSelf().getLogger().debug(
                 "Offline replay tick gate resumed after the native dimension transition at replay tick {}",
                 mReplay.getAppliedReplayTick()
             );
@@ -294,36 +311,8 @@ OfflineRenderStepResult OfflineRenderBoundary::advance(ExportFramePlan const& fr
                 if (now - mReplayTickRequestedAt < ReplayTickWaitTimeout) {
                     return OfflineRenderStepResult::Waiting;
                 }
-                if (mReplayTickRecoveryCount >= MaxReplayTickRecoveries) {
-                    fault(
-                        OfflineRenderBoundaryError::TickUnavailable,
-                        "The offline replay tick did not execute after two gate recoveries"
-                    );
-                    return OfflineRenderStepResult::Failed;
-                }
-
-                ++mReplayTickRecoveryCount;
-                Playback::getInstance().getSelf().getLogger().warn(
-                    "Recovering stalled offline replay tick token {} for export frame {} at replay tick {} ({}/{})",
-                    mReplayTickToken->id,
-                    mPendingFrame->ticket.frameIndex,
-                    mReplay.getAppliedReplayTick(),
-                    mReplayTickRecoveryCount,
-                    MaxReplayTickRecoveries
-                );
-                mReplayTickToken.reset();
-                mReplayTickRequestedAt = {};
-                runtime::endOfflineReplayTickGate();
-                mTickGateOpen = false;
-                if (!runtime::beginOfflineReplayTickGate()) {
-                    fault(
-                        OfflineRenderBoundaryError::TickUnavailable,
-                        "Unable to recover the offline replay tick gate"
-                    );
-                    return OfflineRenderStepResult::Failed;
-                }
-                mTickGateOpen = true;
-                return OfflineRenderStepResult::Waiting;
+                fault(OfflineRenderBoundaryError::TickUnavailable, "The offline replay tick did not execute");
+                return OfflineRenderStepResult::Failed;
             }
 
             auto const completion = runtime::getOfflineReplayTickCompletion(*mReplayTickToken);
@@ -344,8 +333,7 @@ OfflineRenderStepResult OfflineRenderBoundary::advance(ExportFramePlan const& fr
             }
             if (!mTimelineInitialized) mInitializationTickObserved = true;
             mReplayTickToken.reset();
-            mReplayTickRecoveryCount = 0;
-            mReplayTickRequestedAt   = {};
+            mReplayTickRequestedAt = {};
         }
 
         auto requestReplayTick = [&]() -> OfflineRenderStepResult {
@@ -397,6 +385,7 @@ OfflineRenderStepResult OfflineRenderBoundary::advance(ExportFramePlan const& fr
             }
             mTimelineInitialized        = true;
             mInitializationTickObserved = false;
+            mCaptureArmed               = false;
             mState                      = OfflineRenderBoundaryState::WarmingUp;
         }
 
@@ -405,118 +394,80 @@ OfflineRenderStepResult OfflineRenderBoundary::advance(ExportFramePlan const& fr
             return advanceWarmup(*mPendingFrame);
         }
 
-        if (!mClockToken) {
-            if (!publishClockSample(*mPendingFrame)) return OfflineRenderStepResult::Failed;
-        }
-
-        switch (mDownloads.requestDownload(mPendingFrame->ticket)) {
-        case FrameDownloadRequestResult::Requested:
-            mState                  = OfflineRenderBoundaryState::AwaitingDownload;
-            mRenderWaitPolls        = 0;
-            mRenderWaitStartedAt    = std::chrono::steady_clock::now();
-            mRenderWaitLastLoggedAt = {};
-            break;
-        case FrameDownloadRequestResult::Busy:
-            clearClockSample();
-            return OfflineRenderStepResult::Waiting;
-        case FrameDownloadRequestResult::Backpressured:
-            clearClockSample();
-            return OfflineRenderStepResult::Backpressured;
-        case FrameDownloadRequestResult::Closed:
-            fault(OfflineRenderBoundaryError::CaptureUnavailable, "The framebuffer download queue is closed");
-            return OfflineRenderStepResult::Failed;
-        case FrameDownloadRequestResult::InvalidTicket:
-            fault(OfflineRenderBoundaryError::InvalidFrame, "The renderer rejected the export frame ticket");
-            return OfflineRenderStepResult::Failed;
-        case FrameDownloadRequestResult::Failed: {
-            auto const downloadStatus = mDownloads.status();
-            fault(
-                OfflineRenderBoundaryError::CaptureFailed,
-                downloadStatus.message.empty() ? "The framebuffer download request failed" : downloadStatus.message
-            );
-            return OfflineRenderStepResult::Failed;
-        }
-        }
+        if (!mClockToken && !publishClockSample(*mPendingFrame)) return OfflineRenderStepResult::Failed;
+        mState                  = OfflineRenderBoundaryState::AwaitingDownload;
+        mRenderWaitStartedAt    = std::chrono::steady_clock::now();
+        mRenderWaitLastLoggedAt = {};
     }
 
     if (mState == OfflineRenderBoundaryState::WarmingUp) return advanceWarmup(*mPendingFrame);
 
-    if (mState == OfflineRenderBoundaryState::AwaitingDownload) {
-        if (!mClockToken) {
-            fault(OfflineRenderBoundaryError::ClockUnavailable, "The explicit offline render lost its clock sample");
-            return OfflineRenderStepResult::Failed;
-        }
-        switch (mExecutor.executeSample(*mPendingFrame, *mClockToken)) {
-        case OfflineRenderFrameExecutionResult::Waiting:
-            return OfflineRenderStepResult::Waiting;
-        case OfflineRenderFrameExecutionResult::Executed:
-            break;
-        case OfflineRenderFrameExecutionResult::Failed: {
-            auto const executorStatus = mExecutor.status();
-            fault(
-                OfflineRenderBoundaryError::CaptureUnavailable,
-                executorStatus.message.empty() ? "The explicit offline render failed" : executorStatus.message
-            );
-            return OfflineRenderStepResult::Failed;
-        }
-        }
+    if (mState != OfflineRenderBoundaryState::AwaitingDownload) return OfflineRenderStepResult::Waiting;
+    if (!mClockToken) {
+        fault(OfflineRenderBoundaryError::ClockUnavailable, "The explicit offline render lost its clock sample");
+        return OfflineRenderStepResult::Failed;
     }
 
-    bool const downloadStarted = mDownloads.hasDownloadStarted(mPendingFrame->ticket);
-    if (!downloadStarted) {
-        auto const downloadStatus = mDownloads.status();
-        if (downloadStatus.state == FrameDownloadQueueState::Faulted) {
-            if (recoverDownloadFailure(downloadStatus)) return OfflineRenderStepResult::Waiting;
-            fault(
-                OfflineRenderBoundaryError::CaptureFailed,
-                downloadStatus.message.empty() ? "The renderer frame download failed" : downloadStatus.message
-            );
-            return OfflineRenderStepResult::Failed;
-        }
-        if (downloadStatus.state == FrameDownloadQueueState::Cancelled
-            || downloadStatus.state == FrameDownloadQueueState::Closed) {
-            fault(
-                OfflineRenderBoundaryError::CaptureUnavailable,
-                downloadStatus.message.empty() ? "The framebuffer download queue became unavailable"
-                                               : downloadStatus.message
-            );
-            return OfflineRenderStepResult::Failed;
-        }
-        if (mState == OfflineRenderBoundaryState::AwaitingDownload && downloadStatus.renderRequested) {
-            auto const now = std::chrono::steady_clock::now();
-            if (mRenderWaitStartedAt == std::chrono::steady_clock::time_point{}) mRenderWaitStartedAt = now;
-            ++mRenderWaitPolls;
-            if (mRenderWaitLastLoggedAt == std::chrono::steady_clock::time_point{}
-                || now - mRenderWaitLastLoggedAt >= RenderWaitLogInterval) {
-                auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - mRenderWaitStartedAt);
-                Playback::getInstance().getSelf().getLogger().debug(
-                    "Offline render waiting for scene submit/FrameTap (elapsedMs={}, polls={}, frame={}, tapArmed={}, "
-                    "tapInFlight={}, renderSize={}x{})",
-                    elapsed.count(),
-                    mRenderWaitPolls,
-                    mPendingFrame->ticket.frameIndex,
-                    downloadStatus.tap.armed,
-                    downloadStatus.tap.inFlightFrames,
-                    mExecutor.status().renderWidth,
-                    mExecutor.status().renderHeight
-                );
-                mRenderWaitLastLoggedAt = now;
-            }
-            if (now - mRenderWaitStartedAt > RenderWaitTimeout) {
-                fault(
-                    OfflineRenderBoundaryError::CaptureFailed,
-                    "The matching FrameTap capture did not start within 30 seconds"
-                );
-                return OfflineRenderStepResult::Failed;
-            }
-        }
+    // Retried every step: the tap refuses while a previous capture is in flight, and one refusal must not strand the
+    // frame.
+    if (!mCaptureArmed) {
+        mCaptureArmed = editor::graphics::gImGuiRenderer.armExportCapture(mPendingFrame->ticket);
+    }
+
+    auto const captureStatus = editor::graphics::gImGuiRenderer.exportCaptureStatus();
+    if (captureStatus.state == visuals::FrameTapState::Faulted) {
+        fault(
+            OfflineRenderBoundaryError::CaptureFailed,
+            captureStatus.message.empty() ? "The export frame capture failed" : captureStatus.message
+        );
+        return OfflineRenderStepResult::Failed;
+    }
+    if (captureStatus.state != visuals::FrameTapState::Active) {
+        fault(
+            OfflineRenderBoundaryError::CaptureUnavailable,
+            captureStatus.message.empty() ? "The export frame capture became unavailable" : captureStatus.message
+        );
+        return OfflineRenderStepResult::Failed;
+    }
+
+    // executeSample only reports the clock being applied, not that the Present capture landed.
+    auto const executed = mExecutor.executeSample(*mPendingFrame, *mClockToken);
+    if (executed == OfflineRenderFrameExecutionResult::Failed) {
+        auto const executorStatus = mExecutor.status();
+        fault(
+            OfflineRenderBoundaryError::CaptureUnavailable,
+            executorStatus.message.empty() ? "The explicit offline render failed" : executorStatus.message
+        );
+        return OfflineRenderStepResult::Failed;
+    }
+
+    if (captureStatus.bufferedFrames != 0) {
+        mRenderWaitStartedAt    = {};
+        mRenderWaitLastLoggedAt = {};
         return OfflineRenderStepResult::Waiting;
     }
 
-    mRenderWaitPolls        = 0;
-    mRenderWaitStartedAt    = {};
-    mRenderWaitLastLoggedAt = {};
-
+    auto const now = std::chrono::steady_clock::now();
+    if (mRenderWaitStartedAt == std::chrono::steady_clock::time_point{}) mRenderWaitStartedAt = now;
+    if (mRenderWaitLastLoggedAt == std::chrono::steady_clock::time_point{}
+        || now - mRenderWaitLastLoggedAt >= RenderWaitLogInterval) {
+        auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - mRenderWaitStartedAt);
+        Playback::getInstance().getSelf().getLogger().debug(
+            "Offline render waiting for the Present capture (frame={}, elapsedMs={}, armed={}, inFlight={}, "
+            "buffered={}, state={})",
+            mPendingFrame->ticket.frameIndex,
+            elapsed.count(),
+            captureStatus.armed,
+            captureStatus.inFlightFrames,
+            captureStatus.bufferedFrames,
+            static_cast<uint32_t>(captureStatus.state)
+        );
+        mRenderWaitLastLoggedAt = now;
+    }
+    if (now - mRenderWaitStartedAt > RenderWaitTimeout) {
+        fault(OfflineRenderBoundaryError::CaptureFailed, "The export frame was not captured within 30 seconds");
+        return OfflineRenderStepResult::Failed;
+    }
     return OfflineRenderStepResult::Waiting;
 }
 
@@ -531,27 +482,13 @@ bool OfflineRenderBoundary::beginDrain() {
 bool OfflineRenderBoundary::isDrained() {
     if (mState != OfflineRenderBoundaryState::Draining) return false;
     mExecutor.pollCapture();
-    return mDownloads.isEmpty();
-}
-
-bool OfflineRenderBoundary::retryCompletedFrame(visuals::FrameTicket const& ticket) {
-    if (mState != OfflineRenderBoundaryState::Ready || mPendingFrame || !mCompletedFrameTicket || !mLastSubmittedFrame
-        || !ticketsEqual(*mCompletedFrameTicket, ticket) || !ticketsEqual(mLastSubmittedFrame->ticket, ticket)
-        || !mDownloads.isEmpty()) {
-        return false;
-    }
-    mCompletedFrameTicket.reset();
-    mWarmupFramesRemaining = std::max(mWarmupFramesRemaining, ClearRetryWarmupFrames);
-    mWarmupStableFrames    = 0;
-    mWarmupStartedAt       = {};
-    mWarmupLastLoggedAt    = {};
-    mState                 = OfflineRenderBoundaryState::WarmingUp;
-    return true;
+    auto const capture = editor::graphics::gImGuiRenderer.exportCaptureStatus();
+    return capture.bufferedFrames == 0 && capture.inFlightFrames == 0 && !capture.armed;
 }
 
 std::optional<visuals::CapturedFrame> OfflineRenderBoundary::finishDownload() {
     mExecutor.pollCapture();
-    auto frame = mDownloads.finishDownload();
+    auto frame = editor::graphics::gImGuiRenderer.collectExportFrame();
     if (!frame) return std::nullopt;
 
     if (!mPendingFrame) {
@@ -574,9 +511,9 @@ std::optional<visuals::CapturedFrame> OfflineRenderBoundary::finishDownload() {
 
     mExecutor.completeSample(mPendingFrame->ticket);
     clearClockSample();
+    mCaptureArmed       = false;
     mLastSubmittedFrame = mPendingFrame;
     mPendingFrame.reset();
-    mCaptureRetryCount    = 0;
     mCompletedFrameTicket = frame->ticket;
     mState                = OfflineRenderBoundaryState::Ready;
     return frame;
@@ -587,29 +524,23 @@ OfflineRenderBoundaryStatus OfflineRenderBoundary::status() {
     result.state                 = mState;
     result.error                 = mError;
     result.message               = mMessage;
-    result.downloads             = mDownloads.status();
+    result.capture               = editor::graphics::gImGuiRenderer.exportCaptureStatus();
     result.executor              = mExecutor.status();
     result.warmupFramesRemaining = mWarmupFramesRemaining;
     result.warmupStableFrames    = mWarmupStableFrames;
+    // A drained capture reports Completed, so only an explicit failure or cancellation is a fault here.
     if (result.state != OfflineRenderBoundaryState::Faulted) {
-        if (result.downloads.state == FrameDownloadQueueState::Faulted) {
-            if (recoverDownloadFailure(result.downloads)) {
-                result.downloads = mDownloads.status();
-                result.state     = mState;
-            } else {
-                fault(
-                    OfflineRenderBoundaryError::CaptureFailed,
-                    result.downloads.message.empty() ? "The renderer frame download failed" : result.downloads.message
-                );
-            }
+        if (result.capture.state == visuals::FrameTapState::Faulted) {
+            fault(
+                OfflineRenderBoundaryError::CaptureFailed,
+                result.capture.message.empty() ? "The export frame capture failed" : result.capture.message
+            );
         } else if (result.state != OfflineRenderBoundaryState::Closed
                    && result.state != OfflineRenderBoundaryState::Cancelled
-                   && (result.downloads.state == FrameDownloadQueueState::Closed
-                       || result.downloads.state == FrameDownloadQueueState::Cancelled)) {
+                   && result.capture.state == visuals::FrameTapState::Cancelled) {
             fault(
                 OfflineRenderBoundaryError::CaptureUnavailable,
-                result.downloads.message.empty() ? "The framebuffer download queue became unavailable"
-                                                 : result.downloads.message
+                result.capture.message.empty() ? "The export frame capture became unavailable" : result.capture.message
             );
         }
     }
@@ -667,7 +598,7 @@ void OfflineRenderBoundary::updateExportCamera(ExportFramePlan const& frame) {
 
     auto const cameraSample =
         keyframe::sampleCameraTimeline(keyframe::CameraTimelineSource::Export, sample->replayTime);
-    std::optional<replay::ReplayCameraViewpoint> viewpoint;
+    auto viewpoint = mReplay.exportCameraViewpoint();
     if (cameraSample) {
         viewpoint = replay::ReplayCameraViewpoint{
             cameraSample->state.x,
@@ -675,6 +606,8 @@ void OfflineRenderBoundary::updateExportCamera(ExportFramePlan const& frame) {
             cameraSample->state.z,
             cameraSample->state.pitch,
             cameraSample->state.yaw,
+            cameraSample->state.roll,
+            cameraSample->state.fov,
         };
     }
     mReplay.setExportCameraViewpoint(viewpoint);
@@ -694,23 +627,13 @@ OfflineRenderStepResult OfflineRenderBoundary::advanceWarmup(ExportFramePlan con
     case OfflineRenderFrameExecutionResult::Waiting: {
         auto const now = std::chrono::steady_clock::now();
         if (mRenderWaitStartedAt == std::chrono::steady_clock::time_point{}) mRenderWaitStartedAt = now;
-        ++mRenderWaitPolls;
         if (mRenderWaitLastLoggedAt == std::chrono::steady_clock::time_point{}
             || now - mRenderWaitLastLoggedAt >= RenderWaitLogInterval) {
-            auto const elapsed  = std::chrono::duration_cast<std::chrono::milliseconds>(now - mRenderWaitStartedAt);
-            auto const executor = mExecutor.status();
+            auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - mRenderWaitStartedAt);
             Playback::getInstance().getSelf().getLogger().debug(
-                "Offline warm-up waiting for render completion (elapsedMs={}, polls={}, remaining={}, frame={}, "
-                "clockApplied={}, clockCompleted={}, uiStable={}, stableFrames={}/{})",
-                elapsed.count(),
-                mRenderWaitPolls,
+                "Offline warm-up waiting for render completion (remaining={}, elapsedMs={})",
                 mWarmupFramesRemaining,
-                frame.ticket.frameIndex,
-                wasOfflineRenderClockSampleApplied(*mClockToken),
-                wasOfflineRenderClockSampleCompleted(*mClockToken),
-                executor.uiStable,
-                mWarmupStableFrames,
-                StableWarmupFrames
+                elapsed.count()
             );
             mRenderWaitLastLoggedAt = now;
         }
@@ -740,7 +663,6 @@ OfflineRenderStepResult OfflineRenderBoundary::advanceWarmup(ExportFramePlan con
         return OfflineRenderStepResult::Failed;
     }
 
-    mRenderWaitPolls        = 0;
     mRenderWaitStartedAt    = {};
     mRenderWaitLastLoggedAt = {};
     mExecutor.completeWarmup();
@@ -778,32 +700,6 @@ OfflineRenderStepResult OfflineRenderBoundary::advanceWarmup(ExportFramePlan con
 
 bool OfflineRenderBoundary::warmupComplete() const {
     return mWarmupFramesRemaining == 0 && mWarmupStableFrames >= StableWarmupFrames;
-}
-
-bool OfflineRenderBoundary::recoverDownloadFailure(FrameDownloadQueueStatus const& status) {
-    if (status.state != FrameDownloadQueueState::Faulted || status.error != visuals::FrameTapError::MapFailed
-        || !mPendingFrame || mCaptureCapacity == 0 || mCaptureRetryCount >= MaxCaptureRetries) {
-        return false;
-    }
-
-    ++mCaptureRetryCount;
-    Playback::getInstance().getSelf().getLogger().warn(
-        "Retrying D3D frame readback for export frame {} ({}/{}) after: {}",
-        mPendingFrame->ticket.frameIndex,
-        mCaptureRetryCount,
-        MaxCaptureRetries,
-        status.message.empty() ? "map failure" : status.message
-    );
-
-    mExecutor.completeSample(mPendingFrame->ticket);
-    clearClockSample();
-    if (!mDownloads.open(mCaptureCapacity)) return false;
-
-    mRenderWaitPolls        = 0;
-    mRenderWaitStartedAt    = {};
-    mRenderWaitLastLoggedAt = {};
-    mState                  = OfflineRenderBoundaryState::PreparingReplay;
-    return true;
 }
 
 bool OfflineRenderBoundary::publishClockSample(ExportFramePlan const& frame) {
@@ -846,16 +742,12 @@ void OfflineRenderBoundary::fault(OfflineRenderBoundaryError error, std::string 
         mTickGateOpen = false;
     }
     mReplay.endExportTimeline();
-    mDownloads.cancel();
+    editor::graphics::gImGuiRenderer.closeExportCapture();
     mExecutor.close();
     mPendingFrame.reset();
     mCompletedFrameTicket.reset();
-    mCaptureCapacity               = 0;
-    mCaptureRetryCount             = 0;
-    mReplayTickRecoveryCount       = 0;
     mWarmupFramesRemaining         = 0;
     mWarmupStableFrames            = 0;
-    mRenderWaitPolls               = 0;
     mRenderWaitStartedAt           = {};
     mRenderWaitLastLoggedAt        = {};
     mReplayTickRequestedAt         = {};

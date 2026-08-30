@@ -1,19 +1,17 @@
 ﻿#pragma once
 
+#include "playback/editor/ui/PanelContext.h"
 #include "playback/state/EditorAction.h"
 #include "playback/state/EditorState.h"
 #include "playback/state/editing/models/SelectionModel.h"
 
 #include "EditorTheme.h"
-#include "HintBar.h"
 #include "modes/EditMode.h"
 #include "modes/RenderMode.h"
-#include "panels/CurveEditorPanel.h"
 #include "panels/DetailsPanel.h"
 #include "panels/StatusPanel.h"
 #include "panels/TimelinePanel.h"
 #include "panels/ViewportPanel.h"
-#include "playback/editor/input/KeyMap.h"
 #include "playback/editor/ui/components/Splitter.h"
 #include "playback/editor/ui/menus/EditorMenuBar.h"
 #include "playback/editor/ui/modes/ModeManager.h"
@@ -25,19 +23,15 @@
 
 namespace playback::editor::ui {
 
-class ReplayEditor {
+class ReplayEditor : public EditorCommands {
 public:
-    using SubmitAction = std::function<void(playback::state::EditorAction)>;
-
     static ReplayEditor& getInstance();
 
-    // Core lifecycle
     void initialize();
     void shutdown();
 
     void draw(playback::state::EditorState const& state, SubmitAction const& submit);
 
-    // Keyboard shortcut processing
     void handleKeyboardShortcuts();
 
     [[nodiscard]] playback::state::EditorState const&          state() const;
@@ -45,39 +39,36 @@ public:
     state::editing::model::SelectionModel&                     selection() { return mSelection; }
     void                                                       submitAction(playback::state::EditorAction action) const;
     void                                                       openExportDialog();
-    void                                                       seekTo(int tick);
-    void                                                       seekRelative(int tickDelta);
-    bool                                                       deleteSelection();
-    bool                                                       addKeyframeAtPlayhead();
-    CurveEditorPanel&                                          curveEditorPanel() { return mCurveEditorPanel; }
+
+    void               seekTo(int tick) override;
+    void               seekRelative(int tickDelta) override;
+    void               toggleViewportMaximized() override { mViewportMaximized = !mViewportMaximized; }
+    [[nodiscard]] bool isViewportMaximized() const override { return mViewportMaximized; }
+    bool               deleteSelection() override;
+    bool               addKeyframeAtPlayhead() override;
+
     void                      setGameTexture(ImTextureID texture) { mViewportPanel.setGameTexture(texture); }
     [[nodiscard]] ImTextureID gameTexture() const { return mViewportPanel.gameTexture(); }
     void                      setVideoAspectRatio(float aspectRatio);
     [[nodiscard]] float       videoAspectRatio() const { return mVideoAspectRatio; }
     [[nodiscard]] Rect        viewportVideoRect() const { return mViewportPanel.videoRect(); }
-    void                      toggleViewportMaximized() { mViewportMaximized = !mViewportMaximized; }
-    [[nodiscard]] bool        isViewportMaximized() const { return mViewportMaximized; }
 
 private:
     ReplayEditor() = default;
 
+    [[nodiscard]] PanelContext frameContext();
+
     bool mViewportMaximized{false};
 
-    // Core components
-    EditorTheme   mTheme;
     ModeManager&  mModeManager{ModeManager::getInstance()};
     EditorMenuBar mMenuBar;
-    HintBar       mHintBar;
     Splitter      mSplitter;
 
-    // Panels
-    ViewportPanel    mViewportPanel;
-    DetailsPanel     mDetailsPanel;
-    TimelinePanel    mTimelinePanel;
-    StatusPanel      mStatusPanel;
-    CurveEditorPanel mCurveEditorPanel;
+    ViewportPanel mViewportPanel;
+    DetailsPanel  mDetailsPanel;
+    TimelinePanel mTimelinePanel;
+    StatusPanel   mStatusPanel;
 
-    // Modes
     EditMode   mEditMode;
     RenderMode mRenderMode;
 
@@ -86,7 +77,8 @@ private:
     state::editing::model::SelectionModel mSelection;
     exporting::ExportState                mLastExportState{exporting::ExportState::Idle};
 
-    // Layout
+    float mExitHoldSeconds{};
+
     float mDetailsWidthRatio{0.28f};
     float mTimelineHeightRatio{0.35f};
     float mVideoAspectRatio{16.0f / 9.0f};
@@ -102,8 +94,8 @@ private:
     void loadLayoutPreferences();
     void saveLayoutPreferences() const;
     void syncTimelineViewPreferences(std::string_view replayPath);
+    void updateExitHold();
 
-    // Allow EditMode to access ReplayEditor members
     friend class EditMode;
     friend class RenderMode;
 };

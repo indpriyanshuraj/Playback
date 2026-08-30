@@ -15,7 +15,10 @@
 #include "mc/client/gui/screens/models/MinecraftScreenModel.h"
 #include "mc/client/network/LegacyClientNetworkHandler.h"
 #include "mc/client/options/IOptions.h"
+#include "mc/client/particle/ParticleEngine.h"
+#include "mc/client/particlesystem/particle/ParticleSystemEngine.h"
 #include "mc/client/player/LocalPlayer.h"
+#include "mc/client/renderer/game/LevelRenderer.h"
 #include "mc/deps/core/utility/ReadOnlyBinaryStream.h"
 #include "mc/deps/ecs/gamerefs_entity/EntityContext.h"
 #include "mc/deps/ecs/strict/StrictEntityContext.h"
@@ -107,8 +110,9 @@ constexpr std::string_view ReplayLevelIdPrefix        = "__playback_replay_world
 constexpr auto             CenterChunkInjectionBudget = std::chrono::milliseconds(8);
 constexpr auto             OuterChunkInjectionBudget  = std::chrono::milliseconds(4);
 constexpr auto             SnapshotGamePacketBudget   = std::chrono::milliseconds(2);
-constexpr int              SeekTicksPerClientTick     = 400;
-constexpr std::array       PlaybackSpeeds{0.05f, 0.1f, 0.2f, 0.5f, 1.0f, 2.0f, 5.0f, 10.0f, 20.0f};
+// Every client tick a seek spills into is one more frame of visible catch-up, so land it in as few as possible.
+constexpr auto       SeekCatchUpBudget = std::chrono::milliseconds(2000);
+constexpr std::array PlaybackSpeeds{0.05f, 0.1f, 0.2f, 0.5f, 1.0f, 2.0f, 5.0f, 10.0f, 20.0f};
 
 bool shouldIgnoreReplayPacket(MinecraftPacketIds packetId) {
     switch (packetId) {
@@ -173,6 +177,15 @@ void cancelNativeMovementInterpolation(Actor& actor, Vec3 const& position, Vec2 
     interpolator->mPositionSteps = 0;
     interpolator->mRotationSteps = 0;
     interpolator->mHeadYawSteps  = 0;
+}
+
+// Replay disables interpolation steps, so packet head/body yaw must be applied directly.
+void pinReplayEntityHeadRotation(Actor& actor, float headYaw, float bodyYaw) {
+    actor.setYHeadRotations(headYaw, headYaw);
+    if (auto bodyRotation = actor.getEntityContext().tryGetComponent<MobBodyRotationComponent>()) {
+        bodyRotation->mYBodyRot  = bodyYaw;
+        bodyRotation->mYBodyRotO = bodyYaw;
+    }
 }
 
 void applyReplayEntityMovement(
@@ -281,6 +294,17 @@ void forceFirstPersonCamera() {
     if (options.getPlayerViewPerspective() != 0) options.setPlayerViewPerspective(0);
 }
 
+// A seek replays every particle event it crosses, so they would all pile up on the landing frame.
+void clearReplayParticles() {
+    auto client = ll::service::getClientInstance();
+    if (!client) return;
+    auto* renderer = client->getLevelRenderer();
+    if (!renderer) return;
+
+    if (auto particles = renderer->mParticleEngine.get()) particles->clear();
+    if (auto systems = renderer->mParticleSystemEngine.get()) systems->clear();
+}
+
 // Server teleport lands one eye height above the request; compensate so the feet agree.
 constexpr float kServerEyeHeight = 1.62f;
 
@@ -344,25 +368,29 @@ bool ReplaySession::start(std::filesystem::path filePath) {
             auto const height  = static_cast<int64_t>(maximum) - static_cast<int64_t>(minimum);
             if (minimum < std::numeric_limits<short>::min() || maximum > std::numeric_limits<short>::max()
                 || minimum % 16 != 0 || maximum <= minimum || height % 16 != 0) {
-                throw std::runtime_error(std::format(
-                    "Replay dimension {} has invalid recorded height range [{}, {})",
-                    snapshot.dimensionId,
-                    minimum,
-                    maximum
-                ));
+                throw std::runtime_error(
+                    std::format(
+                        "Replay dimension {} has invalid recorded height range [{}, {})",
+                        snapshot.dimensionId,
+                        minimum,
+                        maximum
+                    )
+                );
             }
 
             RecordedDimensionHeightRange const range{minimum, maximum};
             auto const [it, inserted] = dimensionProfile->heightRanges.emplace(snapshot.dimensionId, range);
             if (!inserted && it->second != range) {
-                throw std::runtime_error(std::format(
-                    "Replay dimension {} has conflicting recorded height ranges [{}, {}) and [{}, {})",
-                    snapshot.dimensionId,
-                    it->second.minimum,
-                    it->second.maximum,
-                    minimum,
-                    maximum
-                ));
+                throw std::runtime_error(
+                    std::format(
+                        "Replay dimension {} has conflicting recorded height ranges [{}, {}) and [{}, {})",
+                        snapshot.dimensionId,
+                        it->second.minimum,
+                        it->second.maximum,
+                        minimum,
+                        maximum
+                    )
+                );
             }
         }
         mReplayDimensionProfile.store(std::move(dimensionProfile), std::memory_order_release);
@@ -523,11 +551,14 @@ bool ReplaySession::setPaused(bool paused) {
     if (mIsPaused == paused) return true;
 
     bool const wasPreviewing = keyframe::wasPreviewCameraApplied();
-    mIsPaused                = paused;
+    // Hold the fraction the preview stopped at, so resuming continues from the same pose instead of the tick boundary.
+    if (paused) mFrozenPreviewPartial.store(previewPartialTick(), std::memory_order_release);
+    mIsPaused = paused;
     if (!paused) {
         mObserverServerSyncEpoch.fetch_add(1, std::memory_order_acq_rel);
         mObserverServerPositionDirty = false;
         mLastObserverServerSyncChunk.reset();
+        resumePreviewClockFromFrozenPartial();
     }
     getLogger().debug("Replay {} at tick {}", paused ? "paused" : "playing", mCurrentTick);
     if (paused && mExportTimelinePhase == ReplayExportTimelinePhase::Inactive && wasPreviewing) {
@@ -546,7 +577,7 @@ void ReplaySession::parkReplayCameraAtPreview() {
     if (!mReplayPlayer || !mReplayWorldJoined || !mNetworkHandler) return;
     if (mPendingReplayDimension) return;
 
-    auto const sampleTime = getCameraRenderSampleTime(0.0f);
+    auto const sampleTime = getCameraRenderSampleTime();
     if (!sampleTime) return;
     auto const sample = keyframe::sampleCameraTimeline(keyframe::CameraTimelineSource::Preview, *sampleTime);
     if (!sample) return;
@@ -616,18 +647,22 @@ void ReplaySession::syncObserverServerPosition(Vec3 const& feetPosition, Vec2 co
     });
 }
 
-void ReplaySession::setObserverPreviewPartialTick(float partialTick) {
-    mObserverPreviewPartialTick.store(partialTick, std::memory_order_release);
-}
-
 void ReplaySession::updateObserverPreview() {
     if (!mReplayPlayer || !mReplayWorldJoined) return;
     if (mIsPaused) return;
     if (mPendingReplayDimension) return;
     if (!mNetworkHandler) return;
     if (!keyframe::hasCameraTimeline(keyframe::CameraTimelineSource::Preview)) return;
-    auto const time = getCameraRenderSampleTime(mObserverPreviewPartialTick.load(std::memory_order_acquire));
+    auto const time = getCameraRenderSampleTime();
     if (!time) return;
+    // Republishing (a track was toggled or edited) invalidates the cached pose, unlike merely leaving the range.
+    auto const timelineGeneration = keyframe::previewTimelineGeneration();
+    if (mObserverPreviewGeneration != timelineGeneration) {
+        mObserverPreviewGeneration = timelineGeneration;
+        mObserverPreviewInRange    = false;
+        mLastObserverServerSyncChunk.reset();
+    }
+
     auto const sample = keyframe::sampleCameraTimeline(keyframe::CameraTimelineSource::Preview, *time);
     if (!sample) {
         // Leaving the range: pin the observer and server to the last in-range pose.
@@ -652,34 +687,49 @@ void ReplaySession::updateObserverPreview() {
     Vec2 const     rotation{sample->state.pitch, sample->state.yaw};
     ChunkPos const cameraChunk{feetPosition.x, feetPosition.z};
     bool const     serverSyncNeeded = !mLastObserverServerSyncChunk || mLastObserverServerSyncChunk->x != cameraChunk.x
-                               || mLastObserverServerSyncChunk->z != cameraChunk.z;
-    mLastObserverPreviewFeet     = feetPosition;
-    mLastObserverPreviewRotation = rotation;
+                                   || mLastObserverServerSyncChunk->z != cameraChunk.z;
+    mLastObserverPreviewFeet        = feetPosition;
+    mLastObserverPreviewRotation    = rotation;
     teleportReplayPlayer(feetPosition, rotation);
     cancelNativeMovementInterpolation(*mReplayPlayer, feetPosition, rotation, rotation.y);
     if (serverSyncNeeded) syncObserverServerPosition(feetPosition, rotation);
 }
 
-std::optional<visuals::ReplaySampleTime> ReplaySession::getRenderSampleTime(float partialTick) const noexcept {
+void ReplaySession::markReplayTickAdvanced() noexcept {
+    mTickAdvancedAt.store(std::chrono::steady_clock::now(), std::memory_order_release);
+    mFrozenPreviewPartial.store(-1.0f, std::memory_order_release);
+}
+
+// Backdate the tick start by the frozen fraction so the first resumed frame keeps the paused pose.
+void ReplaySession::resumePreviewClockFromFrozenPartial() noexcept {
+    auto const frozen = mFrozenPreviewPartial.exchange(-1.0f, std::memory_order_acq_rel);
+    auto const speed  = mPlaybackSpeed > 0.0f ? mPlaybackSpeed : 1.0f;
+    auto const offset = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<float>(std::max(0.0f, frozen) / (20.0f * speed))
+    );
+    mTickAdvancedAt.store(std::chrono::steady_clock::now() - offset, std::memory_order_release);
+}
+
+float ReplaySession::previewPartialTick() const noexcept {
+    auto const frozen = mFrozenPreviewPartial.load(std::memory_order_acquire);
+    if (frozen >= 0.0f) return frozen;
+
+    auto const advancedAt = mTickAdvancedAt.load(std::memory_order_acquire);
+    if (advancedAt == SteadyTimePoint{}) return 0.0f;
+
+    auto const speed = mPlaybackSpeed > 0.0f ? mPlaybackSpeed : 1.0f;
+    auto const elapsed =
+        std::chrono::duration_cast<std::chrono::duration<float>>(std::chrono::steady_clock::now() - advancedAt).count();
+    constexpr float SecondsPerTick = 1.0f / 20.0f;
+    return std::clamp(elapsed * speed / SecondsPerTick, 0.0f, 1.0f);
+}
+
+// Native render alpha uses a different clock and can move replay sampling backwards.
+std::optional<visuals::ReplaySampleTime> ReplaySession::getCameraRenderSampleTime() const noexcept {
     if (!mActive || !mReplayWorldJoined) return std::nullopt;
 
     auto const appliedTick = std::max(0, mCurrentTick);
-    if (mIsPaused) return visuals::ReplaySampleTime::fromRational(appliedTick, 1);
-
-    return visuals::ReplaySampleTime::fromPreview(std::max(0, appliedTick - 1), partialTick);
-}
-
-std::optional<visuals::ReplaySampleTime> ReplaySession::getCameraRenderSampleTime(float partialTick) const noexcept {
-    if (!mActive || !mReplayWorldJoined) return std::nullopt;
-
-    auto const appliedTick = std::max(0, mCurrentTick);
-    if (mIsPaused) return visuals::ReplaySampleTime::fromRational(appliedTick, 1);
-    return visuals::ReplaySampleTime::fromPreview(appliedTick, partialTick);
-}
-
-std::optional<long double> ReplaySession::getFractionalReplayTick(float partialTick) const noexcept {
-    auto const sample = getRenderSampleTime(partialTick);
-    return sample ? std::optional<long double>{sample->value()} : std::nullopt;
+    return visuals::ReplaySampleTime::fromPreview(appliedTick, previewPartialTick());
 }
 
 bool ReplaySession::beginExportTimeline(int startTick) {
@@ -698,17 +748,34 @@ bool ReplaySession::beginExportTimeline(int startTick) {
     mObserverServerSyncEpoch.fetch_add(1, std::memory_order_acq_rel);
     mObserverServerPositionDirty = false;
     mLastObserverServerSyncChunk.reset();
-    getLogger().info("Export timeline initialization queued (startTick={}, currentTick={})", startTick, mCurrentTick);
+    getLogger().debug("Export timeline initialization queued (startTick={}, currentTick={})", startTick, mCurrentTick);
     return true;
 }
 
 void ReplaySession::setExportCameraViewpoint(std::optional<ReplayCameraViewpoint> viewpoint) noexcept {
     if (viewpoint
         && (!std::isfinite(viewpoint->x) || !std::isfinite(viewpoint->y) || !std::isfinite(viewpoint->z)
-            || !std::isfinite(viewpoint->pitch) || !std::isfinite(viewpoint->yaw))) {
+            || !std::isfinite(viewpoint->pitch) || !std::isfinite(viewpoint->yaw) || !std::isfinite(viewpoint->roll)
+            || !std::isfinite(viewpoint->fov) || viewpoint->fov <= 1.0f || viewpoint->fov >= 179.0f)) {
         viewpoint.reset();
     }
     mExportCameraViewpoint = viewpoint;
+}
+
+std::optional<ReplayCameraViewpoint> ReplaySession::currentCameraViewpoint() const noexcept {
+    if (!isReadyForExport()) return std::nullopt;
+    auto const            position = mReplayPlayer->getPosition();
+    auto const            rotation = mReplayPlayer->getRotation();
+    ReplayCameraViewpoint viewpoint{position.x, position.y, position.z, rotation.x, rotation.y, 0.0f, 70.0f};
+    if (!std::isfinite(viewpoint.x) || !std::isfinite(viewpoint.y) || !std::isfinite(viewpoint.z)
+        || !std::isfinite(viewpoint.pitch) || !std::isfinite(viewpoint.yaw)) {
+        return std::nullopt;
+    }
+    return viewpoint;
+}
+
+std::optional<ReplayCameraViewpoint> ReplaySession::exportCameraViewpoint() const noexcept {
+    return mExportCameraViewpoint;
 }
 
 void ReplaySession::updateExportObserver(ReplayCameraViewpoint const& viewpoint) {
@@ -723,7 +790,7 @@ void ReplaySession::updateExportObserver(ReplayCameraViewpoint const& viewpoint)
     Vec2 const     rotation{viewpoint.pitch, viewpoint.yaw};
     ChunkPos const cameraChunk{feetPosition.x, feetPosition.z};
     bool const     serverSyncNeeded = !mLastObserverServerSyncChunk || mLastObserverServerSyncChunk->x != cameraChunk.x
-                               || mLastObserverServerSyncChunk->z != cameraChunk.z;
+                                   || mLastObserverServerSyncChunk->z != cameraChunk.z;
     teleportReplayPlayer(feetPosition, rotation);
     cancelNativeMovementInterpolation(*mReplayPlayer, feetPosition, rotation, rotation.y);
     if (serverSyncNeeded) syncObserverServerPosition(feetPosition, rotation);
@@ -847,10 +914,36 @@ void ReplaySession::adjustPlaybackSpeed(int direction) {
     getLogger().debug("Replay speed set to {:.2f}x", mPlaybackSpeed);
 }
 
+void ReplaySession::finishSeek() {
+    mSeekTargetTick         = -1;
+    mExportSeekRequested    = false;
+    mSnapMovementDuringSeek = false;
+    settleAfterSeek();
+    // Catch-up ticks bypassed the preview clock, so restart it at the tick the seek landed on.
+    markReplayTickAdvanced();
+    if (mIsPaused) mFrozenPreviewPartial.store(0.0f, std::memory_order_release);
+}
+
+// Per-action snapping misses entities that never moved during catch-up, so settle every recorded one here.
+void ReplaySession::settleAfterSeek() {
+    clearReplayParticles();
+    if (!mReplayPlayer || !mReplayWorldJoined) return;
+
+    auto& level = mReplayPlayer->getLevel();
+    for (auto const& id : mRecordedEntityIds) {
+        auto* actor = level.fetchEntity(id, false);
+        if (!actor || actor == mReplayPlayer) continue;
+        auto const rotation = actor->getRotation();
+        cancelNativeMovementInterpolation(*actor, actor->getPosition(), rotation, rotation.y);
+    }
+}
+
 void ReplaySession::beginSeek(int targetTick) {
     targetTick = std::clamp(targetTick, 0, getTotalTicks());
     if (mReaders.empty()) return;
     if (!refreshReplayPlayer()) throw std::runtime_error("Replay player is unavailable while seeking");
+
+
     mEntityRenderKeys.clear();
     visuals::clearReplayEntityPoses();
 
@@ -967,28 +1060,35 @@ void ReplaySession::tick() {
         int const requestedSeek = mRequestedSeekTick.exchange(-1, std::memory_order_acq_rel);
         if (requestedSeek >= 0) {
             beginSeek(requestedSeek);
-            if (mChunkInjectionPending || mPendingSnapshotApply || mPendingReplayDimension) return;
+            if (mPendingSnapshotApply || mPendingReplayDimension) return;
         }
-        if (mChunkInjectionPending || mPendingSnapshotApply || mPendingReplayDimension) return;
+        if (mPendingSnapshotApply || mPendingReplayDimension) return;
+        // Yielding the tick that finishes a snapshot lets the client rebuild its players before catch-up resumes.
+        if (mChunkInjectionPending) return;
 
         if (mSeekTargetTick >= 0) {
-            int advancedTicks = 0;
-            while (mCurrentTick < mSeekTargetTick && !mChunkInjectionPending && !mPendingSnapshotApply
-                   && !mPendingReplayDimension && advancedTicks < SeekTicksPerClientTick) {
+            auto const deadline = std::chrono::steady_clock::now() + SeekCatchUpBudget;
+            while (mCurrentTick < mSeekTargetTick) {
+                // Draining here instead of returning keeps the rest of this client tick usable for replay.
+                if (mChunkInjectionPending) {
+                    if (!tryFinishChunkInjection(deadline)) {
+                        if (mReplayFailed) throw std::runtime_error("Unable to apply replay chunks");
+                        break;
+                    }
+                    if (mReplayFailed) throw std::runtime_error("Unable to apply replay chunks");
+                }
+                if (mPendingSnapshotApply || mPendingReplayDimension) break;
                 if (!advanceReplayTick(false)) {
                     getLogger().warn("Replay ended at tick {} while seeking to tick {}", mCurrentTick, mSeekTargetTick);
-                    mSeekTargetTick         = -1;
-                    mExportSeekRequested    = false;
-                    mSnapMovementDuringSeek = false;
+                    finishSeek();
                     return;
                 }
-                ++advancedTicks;
+                if (std::chrono::steady_clock::now() >= deadline) break;
             }
+
             if (mCurrentTick >= mSeekTargetTick) {
                 getLogger().debug("Replay seek completed at tick {}", mCurrentTick);
-                mSeekTargetTick         = -1;
-                mExportSeekRequested    = false;
-                mSnapMovementDuringSeek = false;
+                finishSeek();
             }
             return;
         }
@@ -1010,7 +1110,9 @@ void ReplaySession::tick() {
         for (int tick = 0;
              tick < ticksToAdvance && !mChunkInjectionPending && !mPendingSnapshotApply && !mPendingReplayDimension;
              ++tick) {
+            int const before = mCurrentTick;
             if (!advanceReplayTick(true)) break;
+            if (mCurrentTick != before) markReplayTickAdvanced();
         }
     } catch (std::exception const& e) {
         getLogger().error("Replay session failed: {}", e.what());
@@ -1484,7 +1586,7 @@ bool ReplaySession::ensureReplayDimension(
     mDimensionTransitionRequest        = request;
     mDimensionTransitionSettledUpdates = 0;
     mDimensionTransitionStartedAt      = std::chrono::steady_clock::now();
-    getLogger().info(
+    getLogger().debug(
         "Replay dimension transition generation {} started at tick {} from dimension {} to {}",
         generation,
         mCurrentTick,
@@ -1598,7 +1700,7 @@ void ReplaySession::processPendingDimensionTransition() {
     bool const loadingScreenVisible = client
                                    && (client->isShowingLoadingScreen() || client->isShowingProgressScreen()
                                        || client->isShowingWorldProgressScreen());
-    bool const readyToRender = client && client->isReadyToRender();
+    bool const readyToRender        = client && client->isReadyToRender();
 
     if (elapsed >= DIMENSION_TRANSITION_TIMEOUT) {
         getLogger().error(
@@ -1666,9 +1768,9 @@ void ReplaySession::processPendingDimensionTransition() {
     }
 
     if (loadingScreenVisible && mDimensionTransitionSettledUpdates == 0) {
-        getLogger().info(
-            "Replay dimension transition generation {} reached dimension {} while the loading screen remains "
-            "visible; resuming destination snapshot injection (readyToRender={})",
+        getLogger().debug(
+            "Replay dimension transition generation {} reached dimension {} behind the loading screen "
+            "(readyToRender={})",
             mDimensionTransitionRequest->generation,
             mPendingReplayDimension->id,
             readyToRender
@@ -1686,7 +1788,7 @@ void ReplaySession::completeReplayDimensionTransition() {
     auto const elapsed             = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - mDimensionTransitionStartedAt
     );
-    getLogger().info(
+    getLogger().debug(
         "Replay dimension transition generation {} completed at tick {} in dimension {} after {} ms",
         completedGeneration,
         mCurrentTick,
@@ -1954,18 +2056,20 @@ bool ReplaySession::prepareChunkInjectionPlan(PlaybackView const& view) {
     mDirectLevelChunkIndices.clear();
     auto& chunkSource = replayDimension->getChunkSource();
     for (auto const& [pos, identity] : targetColumns) {
-        if (mReusableSnapshotColumns.contains(pos) || identity.levelChunkIndex < 0
-            || !requestModeLevelChunks.contains(pos)) {
+        if (mReusableSnapshotColumns.contains(pos) || identity.levelChunkIndex < 0) continue;
+        if (!requestModeLevelChunks.contains(pos)) {
             continue;
         }
 
         auto covered = subChunkIndicesByColumn.find(pos);
-        if (covered == subChunkIndicesByColumn.end() || covered->second.size() != subChunkCount) continue;
+        if (covered == subChunkIndicesByColumn.end() || covered->second.size() != subChunkCount) {}
         bool const coversCompleteHeight =
             std::all_of(covered->second.begin(), covered->second.end(), [minimumSubChunk, subChunkCount](int index) {
                 return index >= minimumSubChunk && static_cast<size_t>(index - minimumSubChunk) < subChunkCount;
             });
-        if (!coversCompleteHeight) continue;
+        if (!coversCompleteHeight) {
+            continue;
+        }
 
         auto chunk = chunkSource.getExistingChunk(pos);
         if (!chunk || chunk->mIsEmptyClientChunk
@@ -2037,7 +2141,7 @@ bool ReplaySession::prepareChunkInjectionPlan(PlaybackView const& view) {
     return true;
 }
 
-bool ReplaySession::tryFinishChunkInjection() {
+bool ReplaySession::tryFinishChunkInjection(std::optional<std::chrono::steady_clock::time_point> catchUpDeadline) {
     if (!mChunkInjectionPending) return true;
     if (mSnapshotGamePacketPhase == SnapshotGamePacketPhase::WaitingAfterPlayerList) {
         auto const deadline = std::chrono::steady_clock::now() + SnapshotGamePacketBudget;
@@ -2045,7 +2149,9 @@ bool ReplaySession::tryFinishChunkInjection() {
             mReplayFailed = true;
             return false;
         }
-        if (!mPendingSnapshotGamePackets.empty()) return false;
+        if (!mPendingSnapshotGamePackets.empty()) {
+            return false;
+        }
         mSnapshotGamePacketPhase = SnapshotGamePacketPhase::WaitingAfterEntities;
         return false;
     }
@@ -2084,15 +2190,21 @@ bool ReplaySession::tryFinishChunkInjection() {
     bool const   completionProgress = mChunkCompletionObserved.exchange(false, std::memory_order_acq_rel);
     size_t const levelCursorBefore  = mPendingLevelChunkCursor;
     size_t const subCursorBefore    = mPendingSubChunkCursor;
-
-    ++mChunkInjectionTicks;
-    auto const injectionStarted = std::chrono::steady_clock::now();
-    auto const deadline =
-        injectionStarted + (mCenterChunksReady ? OuterChunkInjectionBudget : CenterChunkInjectionBudget);
-    size_t injectedSubChunkPackets = 0;
-    if (!injectReadySubChunkPackets(injectedSubChunkPackets, deadline) || !injectPendingLevelChunks(deadline)
-        || !injectReadySubChunkPackets(injectedSubChunkPackets, deadline)) {
+    auto const   injectionStarted   = std::chrono::steady_clock::now();
+    // A seek shares one deadline across its whole catch-up; normal playback keeps the per-tick frame budget.
+    auto const perTickBudget           = mCenterChunksReady ? OuterChunkInjectionBudget : CenterChunkInjectionBudget;
+    auto const deadline                = catchUpDeadline ? *catchUpDeadline : injectionStarted + perTickBudget;
+    size_t     injectedSubChunkPackets = 0;
+    if (!injectReadySubChunkPackets(injectedSubChunkPackets, deadline) || !injectPendingLevelChunks(deadline)) {
         return false;
+    }
+    // Each SubChunk pass can unblock later ones, so keep going while a pass still injects something.
+    for (;;) {
+        size_t const before = injectedSubChunkPackets;
+        if (!injectReadySubChunkPackets(injectedSubChunkPackets, deadline)) {
+            return false;
+        }
+        if (injectedSubChunkPackets == before) break;
     }
     updateCenterChunkReadiness();
     mChunkInjectionDurationsMs.emplace_back(
@@ -2143,13 +2255,17 @@ bool ReplaySession::tryFinishChunkInjection() {
 bool ReplaySession::injectPendingLevelChunks(std::chrono::steady_clock::time_point deadline) {
     size_t processed = 0;
     while (mPendingLevelChunkCursor < mPendingLevelChunkIndices.size()) {
-        if (processed != 0 && std::chrono::steady_clock::now() >= deadline) break;
+        if (processed != 0 && std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
 
         int const  index  = mPendingLevelChunkIndices[mPendingLevelChunkCursor];
         bool const direct = mDirectLevelChunkIndices.contains(index);
         if (!direct) {
             std::scoped_lock lock(mPendingLevelChunksMutex);
-            if (mPendingLevelChunks.size() >= MAX_LEVEL_CHUNKS_IN_FLIGHT) break;
+            if (mPendingLevelChunks.size() >= MAX_LEVEL_CHUNKS_IN_FLIGHT) {
+                break;
+            }
         }
 
         bool applied = false;
@@ -2184,18 +2300,19 @@ bool ReplaySession::injectReadySubChunkPackets(
     size_t&                               injectedPackets,
     std::chrono::steady_clock::time_point deadline
 ) {
-    std::unordered_set<ChunkPos> completed;
-    {
+    // Injection completes columns synchronously, so re-read rather than snapshotting the set once up front.
+    auto dependenciesMet = [this](std::vector<ChunkPos> const& dependencies) {
+        if (dependencies.empty()) return true;
         std::scoped_lock lock(mPendingLevelChunksMutex);
-        completed = mCompletedLevelChunkPositions;
-    }
+        return std::all_of(dependencies.begin(), dependencies.end(), [this](ChunkPos const& pos) {
+            return mCompletedLevelChunkPositions.contains(pos);
+        });
+    };
 
     for (auto& pending : mPendingSubChunkPackets) {
         if (pending.injected) continue;
         if (std::chrono::steady_clock::now() >= deadline) break;
-        if (!std::all_of(pending.dependencies.begin(), pending.dependencies.end(), [&completed](ChunkPos const& pos) {
-                return completed.contains(pos);
-            })) {
+        if (!dependenciesMet(pending.dependencies)) {
             continue;
         }
         bool const direct = std::all_of(pending.targets.begin(), pending.targets.end(), [this](ChunkPos const& pos) {
@@ -2248,12 +2365,12 @@ void ReplaySession::updateCenterChunkReadiness() {
     mCenterChunksReady = true;
     auto const elapsed =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mChunkInjectionStartedAt);
-    size_t const queuedCenterColumns = static_cast<size_t>(std::count_if(
-        mCenterChunkPositions.begin(),
-        mCenterChunkPositions.end(),
-        [this](ChunkPos const& pos) { return !mReusableSnapshotColumns.contains(pos); }
-    ));
-    size_t const queuedOuterColumns  = mPendingLevelChunkIndices.size() - queuedCenterColumns;
+    size_t const queuedCenterColumns = static_cast<size_t>(
+        std::count_if(mCenterChunkPositions.begin(), mCenterChunkPositions.end(), [this](ChunkPos const& pos) {
+            return !mReusableSnapshotColumns.contains(pos);
+        })
+    );
+    size_t const queuedOuterColumns = mPendingLevelChunkIndices.size() - queuedCenterColumns;
     getLogger().debug(
         "Replay center ready with {} columns in {:.3f} ms after {} ticks; streaming {} outer columns",
         mCenterChunkPositions.size(),
@@ -2366,7 +2483,11 @@ bool ReplaySession::finishChunkInjection() {
     mChunkPlanPreparationMs = 0.0;
 
     if (!applyingSnapshot) {
-        for (auto const& [pos, _] : mPendingSnapshotColumns) mDirtySnapshotColumns.emplace(pos);
+        // A seek re-sends the same columns repeatedly, so record what landed; dirty marks must survive for replay.
+        for (auto& [pos, identity] : mPendingSnapshotColumns) {
+            if (identity.levelChunkIndex < 0) mDirtySnapshotColumns.emplace(pos);
+            else mAppliedSnapshotColumns.insert_or_assign(pos, std::move(identity));
+        }
         mPendingSnapshotColumns.clear();
         mReusableSnapshotColumns.clear();
         mDirectSnapshotColumns.clear();
@@ -2574,6 +2695,7 @@ void ReplaySession::handleConfigurationPacket(PlaybackBuffer& data) {
 }
 
 void ReplaySession::handleGamePacket(PlaybackBuffer& data) {
+
     auto        packetId  = static_cast<MinecraftPacketIds>(data.getVarInt().value());
     auto const  remaining = data.getWritePointer() - data.mReadPointer;
     std::string payload(data.mView.data() + data.mReadPointer, remaining);
@@ -2598,6 +2720,7 @@ void ReplaySession::handleGamePacket(PlaybackBuffer& data) {
 }
 
 void ReplaySession::handleMoveEntities(PlaybackBuffer& data) {
+
     auto dispatchMovementPacket = [this](std::shared_ptr<Packet>& packet) {
         if (!packet || !mNetworkHandler || !packet->mHandler) {
             mReplayFailed = true;
@@ -2652,11 +2775,7 @@ void ReplaySession::handleMoveEntities(PlaybackBuffer& data) {
             if (actor->isRiding()) {
                 actor->mBuiltInComponents->mActorRotationComponent->mRot     = rotation;
                 actor->mBuiltInComponents->mActorRotationComponent->mRotPrev = rotation;
-                actor->setYHeadRotations(headYaw, headYaw);
-                if (auto bodyRotation = entityContext.tryGetComponent<MobBodyRotationComponent>()) {
-                    bodyRotation->mYBodyRot  = bodyYaw;
-                    bodyRotation->mYBodyRotO = bodyYaw;
-                }
+                pinReplayEntityHeadRotation(*actor, headYaw, bodyYaw);
 
                 if (onGround) {
                     if (!entityContext.hasComponent<OnGroundFlagComponent>()) {
@@ -2702,13 +2821,7 @@ void ReplaySession::handleMoveEntities(PlaybackBuffer& data) {
 
             if (!dispatchMovementPacket(packet)) return;
 
-            // MovePlayerPacket has no body-yaw field, so retain the recorded value after native movement handling.
-            if (actor->isPlayer()) {
-                if (auto bodyRotation = entityContext.tryGetComponent<MobBodyRotationComponent>()) {
-                    bodyRotation->mYBodyRot  = bodyYaw;
-                    bodyRotation->mYBodyRotO = bodyYaw;
-                }
-            }
+            pinReplayEntityHeadRotation(*actor, headYaw, bodyYaw);
             if (snapMovement) cancelNativeMovementInterpolation(*actor, position, rotation, headYaw);
             else applyReplayEntityMovement(*actor, position, previousPose, rotation, headYaw);
         }
@@ -2813,6 +2926,7 @@ void ReplaySession::handleMoveEntities(PlaybackBuffer& data) {
         }
         if (actor) {
             Vec2 const rotation{currentPose.pitch, currentPose.yaw};
+            pinReplayEntityHeadRotation(*actor, currentPose.headYaw, currentPose.bodyYaw);
             if (snapMovement) cancelNativeMovementInterpolation(*actor, targetPosition, rotation, currentPose.headYaw);
             else applyReplayEntityMovement(*actor, targetPosition, previousPose, rotation, currentPose.headYaw);
         }
@@ -2932,7 +3046,8 @@ bool ReplaySession::applyGamePacket(MinecraftPacketIds packetId, std::string_vie
         }
     }
 
-    if (!mIsProcessingSnapshot && !mChunkInjectionPending) invalidateSnapshotColumns(*packet);
+    // Must also run while chunks are streaming: a seek keeps applying block updates between batches.
+    if (!mIsProcessingSnapshot) invalidateSnapshotColumns(*packet);
 
     mInjectingPacket.store(packet.get(), std::memory_order_release);
     InjectionReset reset{mInjectingPacket};
@@ -3049,13 +3164,17 @@ bool ReplaySession::clearRecordedEntities() {
 
 bool ReplaySession::applyRequestModeLevelChunkDirect(std::string_view payload) {
     auto const* replayDimension = mReplayDimension.load(std::memory_order_acquire);
-    if (!replayDimension) return false;
+    if (!replayDimension) {
+        return false;
+    }
 
     auto packet = MinecraftPackets::createPacket(MinecraftPacketIds::FullChunkData);
     if (!packet) return false;
 
     ReadOnlyBinaryStream packetStream(payload, false);
-    if (!packet->read(packetStream) || !packetStream.ensureReadCompleted()) return false;
+    if (!packet->read(packetStream) || !packetStream.ensureReadCompleted()) {
+        return false;
+    }
 
     auto const& levelChunk = static_cast<LevelChunkPacket const&>(*packet);
     if (static_cast<bool>(levelChunk.mCacheEnabled) || !static_cast<bool>(levelChunk.mClientNeedsToRequestSubchunks)

@@ -14,8 +14,6 @@ namespace playback::state {
 enum class EditorActionType {
     TogglePause,
     Seek,
-    SkipToStart,
-    SkipToEnd,
     DecreaseSpeed,
     IncreaseSpeed,
     StopReplay,
@@ -30,6 +28,8 @@ enum class EditorActionType {
     RenameReplay,
     ShowReplayInFolder,
     ClearReplayBrowserError,
+    SaveProject,
+    LoadProject,
     UndoEditorEdit,
     RedoEditorEdit,
     AddFreeCamera,

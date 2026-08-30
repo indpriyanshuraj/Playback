@@ -111,10 +111,7 @@ bool OfflineRenderFrameExecutor::configureClientThrottling() {
     renderer.mUseLowFrequencyUIRender = false;
     client->setClientUpdateAndRenderThrottling(false, mRestoreThrottleThreshold, mRestoreThrottleScalar);
     mClientThrottlingConfigured = true;
-    getLogger().info(
-        "Offline client render scheduling configured: throttling=false, lowFrequencyUi=false (previous={})",
-        mRestoreLowFrequencyUiRender
-    );
+    getLogger().debug("Offline client render scheduling configured");
     return true;
 }
 
@@ -198,31 +195,13 @@ bool OfflineRenderFrameExecutor::configureRenderSize(ExportSettings const& setti
     exportViewport.offset->y = 0.0f;
     client->setViewportInfo(exportViewport);
 
-    auto const appliedRenderSize = currentRenderSize(*client);
-    auto const appliedUiSize     = currentUiSize(*client);
-    getLogger().debug(
-        "Offline render surface after apply (requested={}x{}, viewport={}x{}, ui={}x{}, guiScale={})",
-        mRenderWidth,
-        mRenderHeight,
-        appliedRenderSize ? appliedRenderSize->first : 0,
-        appliedRenderSize ? appliedRenderSize->second : 0,
-        appliedUiSize ? appliedUiSize->first : 0,
-        appliedUiSize ? appliedUiSize->second : 0,
-        client->getGuiData()->getGuiScale()
-    );
-
     mRenderSizeChanged = true;
-    getLogger().info(
-        "Offline render surface configured: display={}x{}, viewport={}x{} at ({}, {}), render={}x{}, guiScale={}",
-        mRestoreUiWidth,
-        mRestoreUiHeight,
-        mRestoreViewportWidth,
-        mRestoreViewportHeight,
-        mRestoreViewportOffsetX,
-        mRestoreViewportOffsetY,
+    getLogger().debug(
+        "Offline render surface configured: render={}x{} (restore={}x{})",
         mRenderWidth,
         mRenderHeight,
-        mRestoreGuiScale
+        mRestoreRenderWidth,
+        mRestoreRenderHeight
     );
     return true;
 }
@@ -279,9 +258,8 @@ OfflineRenderFrameExecutor::executeSample(ExportFramePlan const& frame, OfflineR
         if (!prepareNativeRender()) return OfflineRenderFrameExecutionResult::Failed;
         mSampleRenderInvoked = true;
     }
-    bool const applied   = wasOfflineRenderClockSampleApplied(clockToken);
-    bool const completed = wasOfflineRenderClockSampleCompleted(clockToken);
-    if (!applied || !completed) return OfflineRenderFrameExecutionResult::Waiting;
+    // The Present capture is tracked by the boundary, so the clock is the only signal available here.
+    if (!wasOfflineRenderClockSampleApplied(clockToken)) return OfflineRenderFrameExecutionResult::Waiting;
     return OfflineRenderFrameExecutionResult::Executed;
 }
 
@@ -294,9 +272,8 @@ OfflineRenderFrameExecutionResult OfflineRenderFrameExecutor::executeWarmup(Offl
         if (!prepareNativeRender()) return OfflineRenderFrameExecutionResult::Failed;
         mWarmupRenderInvoked = true;
     }
-    bool const applied   = wasOfflineRenderClockSampleApplied(clockToken);
-    bool const completed = wasOfflineRenderClockSampleCompleted(clockToken);
-    if (!applied || !completed) return OfflineRenderFrameExecutionResult::Waiting;
+    // Warm-up frames are never captured, so the native render returning is the only completion signal.
+    if (!wasOfflineRenderClockSampleApplied(clockToken)) return OfflineRenderFrameExecutionResult::Waiting;
     mUiStable = isUiStable();
     return OfflineRenderFrameExecutionResult::Executed;
 }
@@ -325,20 +302,6 @@ bool OfflineRenderFrameExecutor::prepareNativeRender() {
         viewport.offset->x = 0.0f;
         viewport.offset->y = 0.0f;
         client->setViewportInfo(viewport);
-        if (mPendingTicket && (mPendingTicket->frameIndex < 2 || mPendingTicket->frameIndex % 60 == 0)) {
-            auto const appliedRenderSize = currentRenderSize(*client);
-            auto const appliedUiSize     = currentUiSize(*client);
-            getLogger().debug(
-                "Offline render surface before native frame (frame={}, requested={}x{}, viewport={}x{}, ui={}x{})",
-                mPendingTicket->frameIndex,
-                mRenderWidth,
-                mRenderHeight,
-                appliedRenderSize ? appliedRenderSize->first : 0,
-                appliedRenderSize ? appliedRenderSize->second : 0,
-                appliedUiSize ? appliedUiSize->first : 0,
-                appliedUiSize ? appliedUiSize->second : 0
-            );
-        }
     }
 
     return true;

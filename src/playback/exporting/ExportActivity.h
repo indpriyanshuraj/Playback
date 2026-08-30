@@ -27,4 +27,27 @@ inline void setOfflineRenderActivityActive(bool active) noexcept {
     return detail::gOfflineRenderActivityActive.load(std::memory_order_acquire);
 }
 
+namespace detail {
+
+inline std::atomic_bool gOfflineRenderSceneSubmitted{false};
+
+} // namespace detail
+
+// Set by the BGFX submit hook, consumed at Present; updateGraphics returning does not imply a submitted scene.
+inline void markOfflineRenderSceneSubmitted() noexcept {
+    detail::gOfflineRenderSceneSubmitted.store(true, std::memory_order_release);
+}
+
+inline void clearOfflineRenderSceneSubmitted() noexcept {
+    detail::gOfflineRenderSceneSubmitted.store(false, std::memory_order_release);
+}
+
+[[nodiscard]] inline bool consumeOfflineRenderSceneSubmitted() noexcept {
+    return detail::gOfflineRenderSceneSubmitted.exchange(false, std::memory_order_acq_rel);
+}
+
+[[nodiscard]] inline bool isOfflineRenderSceneSubmitted() noexcept {
+    return detail::gOfflineRenderSceneSubmitted.load(std::memory_order_acquire);
+}
+
 } // namespace playback::exporting
